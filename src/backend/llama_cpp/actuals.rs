@@ -28,7 +28,7 @@ pub(crate) async fn fetch_props_actuals(port: u16, timeout: Duration) -> Actuals
   }
 }
 
-async fn fetch_props_body(port: u16, timeout: Duration) -> std::io::Result<Vec<u8>> {
+pub(super) async fn fetch_props_body(port: u16, timeout: Duration) -> std::io::Result<Vec<u8>> {
   let request = format!(
     "GET /props HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
   );

@@ -339,6 +339,7 @@ Quick tour of the top-level keys:
 | `gpu.enable_vulkan_probe`     | Run the `vulkaninfo` fallback probe. Default `true`; `false` skips it when a native NVIDIA/AMD/Metal probe already covers your GPUs.                                      |
 | `gpu.reprobe_interval_secs`   | How often to re-run the full vendor probe chain for hotplug / late driver loads. Default `60`; `0` probes only at daemon start.                                           |
 | `backend.llamacpp.servers`     | llama.cpp build/binary variants (`[{binary, name?}]`), either `llama-server` or the unified `llama`. First = default; each is a selectable "server". `--llama-server` / `LLAMASTASH_LLAMA_SERVER` set the first. |
+| `backend.llamacpp.slot_cache` | Save each llama-server slot to disk before an idle or make-room eviction and restore it on the next launch, so a returning conversation skips prompt reprocessing. Default off. See `docs/usage.md` § Prompt cache across an unload. |
 | `keybindings`                 | Action-name → key-spec overrides. Kdash-style dialect (`ctrl+q`, `shift+tab`, `f1`, …).                                                                                   |
 
 Environment variables:

@@ -82,6 +82,12 @@ backend: # Per-engine config, one block per backend. llama.cpp is the
     strict_fit: false # Refuse (vs degrade) an unplaceable --fit. Env: LLAMASTASH_STRICT_FIT.
     jinja: true # Emit --jinja every launch (tool calling). Config-only.
     map_anthropic_effort: true # Map Anthropic output_config.effort to the engine kwarg. Config-only.
+    slot_cache: # Keep the prompt cache across an eviction. See §"Prompt cache across an unload".
+      enabled: false # Config-only.
+      # dir: /fast/disk/slot-cache # Default: <cache dir>/slot-cache.
+      # max_gb: 32 # Total size cap, oldest files removed first.
+      # max_age_hours: 24 # A file older than this is removed unread.
+      # min_tokens: 1024 # A slot holding fewer tokens is not saved.
   lemonade:
     # servers: [{ binary: /opt/lemonade/lemond }] # lemond path; else PATH.
     # enabled: # tri-state: unset=auto, true=force on, false=force off.
@@ -1525,6 +1531,29 @@ Unknown keys inside `[proxy]` are **rejected loudly** (`#[serde(deny_unknown_fie
 `llamastash daemon start --proxy-port <PORT>` overrides the mode default for that daemon process — CLI flag beats config beats mode default. `--proxy-port 0` binds an ephemeral port; the actual address is reported via `llamastash status --json | jq .proxy.listen`. The flag survives the default detached start (the re-exec'd child receives it on its argv). `--ollama-compat` is similarly propagated.
 
 Port collision (Ollama-compat mode against a running Ollama on `11434`, another listener on the base port, …) leaves the daemon up and reports `proxy.status: "port_in_use"`. Edit `proxy.port` and restart the daemon, or restart with `--proxy-port <free-port>`. The proxy does not auto-roam outside the `base..=base+5` scan window — that would break the "single stable URL" contract.
+
+### Prompt cache across an unload
+
+When the idle sweep or make-room stops a llama.cpp launch, the conversation's prompt cache goes with it, and the next request reprocesses the whole prompt. With `backend.llamacpp.slot_cache.enabled: true` the daemon saves each slot to disk before that stop and reads it back when the model is launched again, before the launch takes traffic. It is off by default: a save writes about as many bytes as the KV cache holds and the eviction waits for it.
+
+```yaml
+backend:
+  llamacpp:
+    slot_cache:
+      enabled: true
+      # dir: /fast/disk/slot-cache   # Default: <cache dir>/slot-cache.
+      # max_gb: 32                   # Total size cap, oldest files removed first.
+      # max_age_hours: 24            # A file older than this is removed unread.
+      # min_tokens: 1024             # A slot holding fewer tokens is not saved.
+```
+
+- **When it saves.** Only before an eviction: the idle sweep (`proxy.idle_ttl_secs`) and make-room. `llamastash stop`, `daemon stop` and a crash save nothing.
+- **Where the files are.** `<dir>/<model file name>-<key>/slot-<N>.bin`, one file per llama-server slot, in directories only your user can read (`0700`). The files hold the conversation's tokens. The key covers the model file's size and modification time and the launch's `llama-server` arguments, so a launch with a different context size, preset or model file starts without a cache instead of reading one made under other settings.
+- **Cleanup.** A file is deleted as soon as it is restored, or when the restore fails. Before every restore and after every save the daemon removes files older than `max_age_hours`, then the oldest files until the total is under `max_gb`. Deleting the directory by hand is safe.
+- **Which conversation gets it.** llama-server chooses a slot by how much of the request's prompt matches what a slot already holds. Each file goes back into the slot it was saved from, so the returning conversation lands on its own cache and anything else is processed as usual.
+- **How to see it.** The daemon log (`<cache dir>/logs/llamastash.log`) has one `slot cache: saved slot ...` and one `slot cache: restored slot ...` line per file, with token count, size and time. llama-server's own `timings.cache_n` in the response is the number of prompt tokens that came from the cache.
+
+Limits: only the llama.cpp backend, only chat launches, and only what is in a slot at the moment of the stop. llama-server's own in-memory prompt cache (`--cache-ram`), which holds conversations that were pushed out of a slot, is not saved. A launch that passes its own `--slot-save-path` after `--` is left alone. Numbers from a 100k-token prompt are in `docs/spikes/2026-10-09-slot-cache-save-restore.md`.
 
 ## Setup subcommands
 

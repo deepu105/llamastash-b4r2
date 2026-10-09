@@ -545,6 +545,29 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     map_anthropic_effort: true
 
+    # Keep a launch's prompt cache across an eviction (default: off). Before
+    # the idle sweep or make-room stops a llama.cpp launch, the daemon saves
+    # each llama-server slot to disk (`--slot-save-path` plus
+    # `POST /slots/N?action=save`) and reads it back when the model is launched
+    # again, so the returning conversation does not reprocess its prompt.
+    # `llamastash stop` and `daemon stop` save nothing.
+    #
+    # A save is about as large as the KV cache: 3.05 GiB for 100k tokens on a
+    # 1B model, more on a larger one. The files hold the conversation's tokens
+    # and sit in 0700 directories.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    slot_cache:
+      enabled: false
+      # Where the files go (default: <cache dir>/slot-cache).
+      # dir: /fast/disk/slot-cache
+      # Total size cap in GiB across all models; oldest files go first.
+      max_gb: 32
+      # A file older than this is deleted unread.
+      max_age_hours: 24
+      # A slot holding fewer tokens is not saved.
+      min_tokens: 1024
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend

@@ -428,7 +428,8 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 4: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
-- [ ] Keep a model's prompt cache across an unload
+- [x] ~~Keep a model's prompt cache across an unload~~
+- [ ] Slot cache follow-up: measure save, restore and file size on a GPU with a large model at 100k tokens (the spike is CPU-only on a 1B model), then decide whether `backend.llamacpp.slot_cache.enabled` can default on ([spike](docs/spikes/2026-10-09-slot-cache-save-restore.md))
 - [ ] Warm the page cache before a load (`llamastash warm <model>`)
 
 ### Batch 5: CLI setup commands ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-5-cli-setup-commands))
