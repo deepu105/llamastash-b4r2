@@ -76,12 +76,22 @@ async fn pre_launch(
   registry: &SupervisorRegistry,
   origin: LaunchOrigin,
 ) -> ManagedModel {
+  let params = LaunchParams::new(PathBuf::from("/tmp/ls-pe.gguf"), LaunchMode::Chat);
+  launch_with(log_dir, registry, origin, params).await
+}
+
+/// [`pre_launch`] with the caller's launch params.
+async fn launch_with(
+  log_dir: &Path,
+  registry: &SupervisorRegistry,
+  origin: LaunchOrigin,
+  params: LaunchParams,
+) -> ManagedModel {
   let port = allocate_port();
   let id = ModelId {
     path: PathBuf::from(format!("/tmp/ls-pe-{port}.gguf")),
     header_blake3: [0u8; 32],
   };
-  let params = LaunchParams::new(PathBuf::from("/tmp/ls-pe.gguf"), LaunchMode::Chat);
   let plan = LlamaCppBackend::new().process_spec(&params, port, fake_binary(), fast_probe());
   let model = supervisor_spawn(ManagedSpawn {
     id,
@@ -641,5 +651,110 @@ async fn make_room_skips_a_candidate_that_took_a_request() {
   drop(_guard);
   assert_eq!(busy.inflight(), 0);
   let _ = busy.stop(Duration::from_secs(2)).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Chat launch params seeded the way a daemon with the slot cache on seeds
+/// them, with the files under `slot_base`.
+fn slot_cache_params(dir: &Path, slot_base: &Path) -> LaunchParams {
+  use llamastash::backend::Backend;
+  let mut backend = llamastash::backend::BackendConfig::default();
+  backend.llamacpp.slot_cache = llamastash::config::SlotCacheConfig {
+    enabled: true,
+    dir: Some(slot_base.to_path_buf()),
+    ..Default::default()
+  };
+  let seed_ctx = MethodContext::with_catalog(ShutdownToken::new(), ModelCatalog::new())
+    .with_backend(backend, BTreeMap::new());
+  let mut params = LaunchParams::new(dir.join("model.gguf"), LaunchMode::Chat);
+  LlamaCppBackend::new().seed_launch_knobs(&seed_ctx, &mut params);
+  params
+}
+
+/// Every file one level below the slot cache base.
+fn slot_files(base: &Path) -> Vec<PathBuf> {
+  std::fs::read_dir(base)
+    .into_iter()
+    .flatten()
+    .flatten()
+    .flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten())
+    .map(|f| f.path())
+    .collect()
+}
+
+/// Make-room stops a launch through the same helper as the sweep, so it saves
+/// the slot too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn make_room_saves_slots_before_the_unload() {
+  let dir = unique_temp("slot-cache-make-room");
+  let log_dir = dir.join("logs");
+  let slot_base = dir.join("slots");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let registry = SupervisorRegistry::new();
+  let params = slot_cache_params(&dir, &slot_base);
+  let model = launch_with(&log_dir, &registry, LaunchOrigin::AutoStart, params).await;
+  let persisted = PersistedState::new(DaemonState::default(), None);
+  stamp_row(&persisted, &registry, &model, None, 500).await;
+  let state =
+    build_state_with_presets(registry, &log_dir, persisted, ConfigPresetStore::empty()).await;
+
+  let fits = eviction::make_room(
+    &state,
+    &Refusal {
+      demand_bytes: 400,
+      effective_free_bytes: 100,
+      reserved_bytes: 0,
+    },
+    |_| {},
+  )
+  .await;
+  assert!(fits);
+  wait_until_not_ready(&model, "slot-cache make-room").await;
+  let saved = slot_files(&slot_base);
+  assert_eq!(saved.len(), 1, "{saved:?}");
+  assert!(saved[0].ends_with("slot-0.bin"));
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// With the slot cache on, the idle sweep saves the launch's slot before the
+/// stop, and the next launch with the same params restores it before `Ready`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sweep_saves_slots_and_the_next_launch_restores_them() {
+  let dir = unique_temp("slot-cache");
+  let log_dir = dir.join("logs");
+  let slot_base = dir.join("slots");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let params = slot_cache_params(&dir, &slot_base);
+
+  let registry = SupervisorRegistry::new();
+  let model = launch_with(&log_dir, &registry, LaunchOrigin::AutoStart, params.clone()).await;
+  assert!(
+    slot_files(&slot_base).is_empty(),
+    "nothing is saved before an eviction"
+  );
+  let state = build_state(registry.clone(), &log_dir).await;
+  state.touch_mru(model.id()).await;
+  sleep(Duration::from_millis(5)).await;
+
+  eviction::sweep_once(&state, Duration::from_nanos(1)).await;
+  wait_until_not_ready(&model, "slot-cache sweep").await;
+
+  let launch_dirs: Vec<PathBuf> = std::fs::read_dir(&slot_base)
+    .expect("the sweep created the slot cache dir")
+    .flatten()
+    .map(|e| e.path())
+    .collect();
+  assert_eq!(launch_dirs.len(), 1, "{launch_dirs:?}");
+  let saved = launch_dirs[0].join("slot-0.bin");
+  assert!(saved.exists(), "the sweep saved slot 0 before the stop");
+
+  // Another port, same params: the same directory, so the file is read back.
+  let again = launch_with(&log_dir, &registry, LaunchOrigin::Manual, params).await;
+  let restored = std::fs::read_to_string(launch_dirs[0].join("restored.log"))
+    .expect("the server was asked to restore before Ready");
+  assert_eq!(restored.trim(), "slot-0.bin");
+  assert!(!saved.exists(), "a restored file is deleted");
+
+  let _ = again.stop(Duration::from_secs(2)).await;
   std::fs::remove_dir_all(&dir).ok();
 }

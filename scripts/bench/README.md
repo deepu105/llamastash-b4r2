@@ -23,6 +23,19 @@ Every script here records the power state next to every result for exactly this
 reason. Stop stray daemons (`llamastash daemon stop`, `pkill -x ds4-server`)
 before a run so nothing competes for the GPU or the power budget.
 
+## `slot_cache_spike.py` — slot save / restore against reprocessing
+
+```sh
+scripts/bench/slot_cache_spike.py --server <llama-server> --model <gguf> \
+  --tokens 10000,100000 --threads 8 --work-dir <dir off tmpfs> --out spike.json
+```
+
+For each prompt size it processes the prompt, saves slot 0, restarts the server,
+restores the file (once from page cache, once after dropping it) and sends the
+prompt plus a short follow-up. Python stdlib only, one server at a time. The
+numbers behind `backend.llamacpp.slot_cache` are in
+`docs/spikes/2026-10-09-slot-cache-save-restore.md`.
+
 ## `mtp_ab.sh` — MTP on/off for one model
 
 ```sh

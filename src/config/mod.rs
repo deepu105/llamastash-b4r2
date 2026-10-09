@@ -14,7 +14,7 @@ pub mod yaml_edit;
 
 pub use crate::backend::generic::GenericConfig;
 pub use crate::backend::lemonade::LemonadeConfig;
-pub use crate::backend::llama_cpp::LlamaCppConfig;
+pub use crate::backend::llama_cpp::{LlamaCppConfig, SlotCacheConfig};
 pub use crate::backend::sglang::SglangConfig;
 pub use crate::backend::vllm::VllmConfig;
 pub use crate::backend::BackendConfig;

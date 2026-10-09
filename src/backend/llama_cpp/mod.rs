@@ -17,10 +17,12 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+mod slot_cache;
 mod telemetry;
 
 use compose::compose;
 pub use list_devices::{parse_list_devices, probe_devices, BinaryDevice};
+pub use slot_cache::SlotCacheConfig;
 
 use std::path::{Path, PathBuf};
 
@@ -160,6 +162,9 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Keep a launch's prompt cache across an eviction (factory off).
+  #[serde(default)]
+  pub slot_cache: SlotCacheConfig,
 }
 
 fn default_true() -> bool {
@@ -178,6 +183,7 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      slot_cache: SlotCacheConfig::default(),
     }
   }
 }
@@ -226,6 +232,9 @@ impl LlamaCppBackend {
   /// orchestrator can branch on lifecycle shape. Call sites that have
   /// already committed to a process spawn (and tests) can skip the enum
   /// and build the spec straight away.
+  ///
+  /// With the slot cache on it also creates the launch's slot directory, which
+  /// `llama-server` requires to exist at startup.
   pub fn process_spec(
     &self,
     params: &LaunchParams,
@@ -233,13 +242,16 @@ impl LlamaCppBackend {
     binary: PathBuf,
     probe: ProbeOptions,
   ) -> ProcessLaunchSpec {
+    let composed = compose(params, port);
+    let slot_cache_argv = slot_cache::launch_argv(params, &composed);
     ProcessLaunchSpec {
       // Delegate to the canonical argv emitter — pinned by parity tests —
       // behind the subcommand the unified app needs (empty for `llama-server`).
       argv: serve_prefix(&binary)
         .iter()
         .map(std::ffi::OsString::from)
-        .chain(compose(params, port))
+        .chain(composed)
+        .chain(slot_cache_argv)
         .collect(),
       binary,
       env_remove: LLAMA_ENV_STRIP.to_vec(),
@@ -463,6 +475,7 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+    slot_cache::seed(&cfg.slot_cache, params);
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {
@@ -501,6 +514,14 @@ impl Backend for LlamaCppBackend {
   ) -> crate::daemon::actuals::Actuals {
     // The llama-server-specific `/props` fetch + `n_ctx` parse.
     actuals::fetch_props_actuals(port, timeout).await
+  }
+
+  async fn after_ready(&self, port: u16, params: &LaunchParams) {
+    slot_cache::restore(port, params).await;
+  }
+
+  async fn before_evict(&self, port: u16, params: &LaunchParams) {
+    slot_cache::save(port, params).await;
   }
 
   fn gpu_resident(&self, params: &LaunchParams, layer_count: Option<u64>) -> bool {

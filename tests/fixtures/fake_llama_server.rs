@@ -50,6 +50,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug, Clone)]
 struct Args {
+  /// `--slot-save-path`: where `/slots/N?action=save|restore` reads and writes.
+  slot_save_path: Option<String>,
   host: String,
   port: u16,
   model_path: String,
@@ -130,6 +132,7 @@ fn parse_args() -> Args {
   let mut sigterm_exit_delay_ms = None;
   let mut print_env = Vec::new();
   let mut spec_mtp = false;
+  let mut slot_save_path = None;
   while let Some(arg) = args.next() {
     match arg.as_str() {
       "--host" => host = args.next().expect("--host needs value"),
@@ -150,6 +153,7 @@ fn parse_args() -> Args {
         sigterm_exit_delay_ms = args.next().and_then(|v| v.parse().ok());
       }
       "--print-env" => print_env.extend(args.next()),
+      "--slot-save-path" => slot_save_path = args.next(),
       // Silently ignore unknown flags so the supervisor can pass
       // through reasoning bundles + advanced overrides without
       // teaching the fixture every llama-server flag.
@@ -168,11 +172,21 @@ fn parse_args() -> Args {
     sigterm_exit_delay_ms,
     print_env,
     spec_mtp,
+    slot_save_path,
   }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
+  // Real llama-server refuses to start when `--slot-save-path` is not an
+  // existing directory.
+  let mut argv = std::env::args();
+  if let Some(dir) = argv.by_ref().skip_while(|a| a != "--slot-save-path").nth(1) {
+    if !std::path::Path::new(&dir).is_dir() {
+      eprintln!("error while handling argument \"--slot-save-path\": not a directory: {dir}");
+      std::process::exit(1);
+    }
+  }
   // `--list-devices` is a one-shot, non-serving invocation: real
   // llama-server prints its adapter table and exits. The daemon's
   // launch-device catalog probe runs exactly `<binary> --list-devices`,
@@ -372,6 +386,51 @@ async fn handle(
         200,
         "application/json",
         body.to_string().as_bytes(),
+      )
+      .await?;
+    }
+    // llama-server's slot save / restore. A save writes a small marker file
+    // and reports a fixed 5000 tokens; a restore of an existing file appends
+    // its name to `restored.log` beside it, and a missing file is a 400.
+    ("POST", slots) if slots.starts_with("/slots/") => {
+      let filename = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("filename")?.as_str().map(str::to_string))
+        .unwrap_or_default();
+      let (status, reply) = match &args.slot_save_path {
+        None => (
+          501,
+          serde_json::json!({ "error": { "message": "no --slot-save-path" } }),
+        ),
+        Some(dir) if slots.ends_with("action=save") => {
+          std::fs::write(format!("{dir}{filename}"), b"fake-slot")?;
+          (
+            200,
+            serde_json::json!({ "n_saved": 5000, "n_written": 9, "timings": { "save_ms": 1.0 } }),
+          )
+        }
+        Some(dir) if std::path::Path::new(&format!("{dir}{filename}")).exists() => {
+          use std::io::Write;
+          let mut log = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(format!("{dir}restored.log"))?;
+          writeln!(log, "{filename}")?;
+          (
+            200,
+            serde_json::json!({ "n_restored": 5000, "n_read": 9, "timings": { "restore_ms": 1.0 } }),
+          )
+        }
+        Some(_) => (
+          400,
+          serde_json::json!({ "error": { "message": "no such file" } }),
+        ),
+      };
+      write_response(
+        &mut wr,
+        status,
+        "application/json",
+        reply.to_string().as_bytes(),
       )
       .await?;
     }
