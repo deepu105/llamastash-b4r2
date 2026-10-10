@@ -428,8 +428,9 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 4: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
-- [ ] Keep a model's prompt cache across an unload
+- [x] ~~Keep a model's prompt cache across an unload~~ — llama.cpp only, chat launches only, `backend.llamacpp.prompt_cache` (default on). Before the idle sweep or make-room stops a launch, every idle slot holding at least `min_tokens` of prompt is written with `--slot-save-path` + `POST /slots/{id}?action=save`; the next launch reads them back in the readiness probe, before it is `Ready`, and llama.cpp's own prefix routing (`--slot-prompt-similarity`) hands them to the returning conversation. Files live in `<cache_dir>/prompt-cache/llamacpp/<model>/` with a manifest, a `max_bytes` budget (oldest first) and a `max_age_secs` expiry. The save/restore calls and the format live in `src/backend/llama_cpp/prompt_cache.rs` behind two no-op-by-default trait hooks (`preserve_prompt_cache` before the eviction stop, `restore_prompt_cache` before `Ready`), so `src/proxy/eviction.rs` and the supervisor name no engine. Measured on this host: 2 881-3 196 s to reprocess 100k tokens on CPU against 0.7 s to save and 0.5-1.3 s to restore ([`docs/spikes/2026-10-10-prompt-cache-across-unload.md`](docs/spikes/2026-10-10-prompt-cache-across-unload.md)).
 - [ ] Warm the page cache before a load (`llamastash warm <model>`)
+  - [ ] A `--slot-save-path` restore reads a 1.7-3 GiB file cold off the disk on the first launch after a reboot (measured 1.26 s against 0.57 s warm on this host); the `posix_fadvise(POSIX_FADV_WILLNEED)` path the item above needs would cover it the same way.
 
 ### Batch 5: CLI setup commands ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-5-cli-setup-commands))
 

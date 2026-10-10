@@ -258,6 +258,14 @@ If you know the projection is wrong for your setup, `llamastash start <model> --
 
 Weights the engine streams from the mapping rather than holding resident are already subtracted — a 103.7 GiB `Qwen3.8-Flash-Next` is priced at about 77 GiB, because its 26.8 GiB per-layer embedding table never becomes resident. Pinning `-- --lazy-mode off` turns that streaming off, and the gate then prices the whole file.
 
+## Saved prompt caches are filling the disk
+
+**Symptom:** `<cache dir>/prompt-cache/llamacpp/` holds gigabytes of `.bin` files a few hours after an agent session.
+
+**Cause:** each file is one slot's KV cache, kept so a conversation that outlived an unload comes back without reprocessing its prompt. At the default KV cache type that is about 3 GiB per 100k prompt tokens, per slot.
+
+**Fix:** `backend.llamacpp.prompt_cache.max_bytes` is the budget per model directory (the oldest saves are deleted first) and `max_age_secs` the expiry; both are documented in [`usage.md` § Prompt cache across an unload](usage.md#prompt-cache-across-an-unload). Deleting the directory by hand is always safe — a missing file is just a cold prompt. `enabled: false` stops saving entirely, and a launch with the feature off carries no `--slot-save-path` at all.
+
 ## ds4 model out-of-memories at load
 
 **Symptom:** a DeepSeek-V4 launch on ds4 dies allocating memory. These GGUFs are 81-300+ GB; the practical floor is about 128 GB on CUDA/ROCm and 96 GB on Metal.

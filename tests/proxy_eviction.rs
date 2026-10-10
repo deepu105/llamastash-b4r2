@@ -76,12 +76,24 @@ async fn pre_launch(
   registry: &SupervisorRegistry,
   origin: LaunchOrigin,
 ) -> ManagedModel {
+  let params = LaunchParams::new(PathBuf::from("/tmp/ls-pe.gguf"), LaunchMode::Chat);
+  pre_launch_params(log_dir, registry, origin, params).await
+}
+
+/// [`pre_launch`] with the caller's launch params, so a test can put a prompt-cache
+/// directory (or anything else `compose` reads) on the argv the fixture runs with.
+async fn pre_launch_params(
+  log_dir: &Path,
+  registry: &SupervisorRegistry,
+  origin: LaunchOrigin,
+  params: LaunchParams,
+) -> ManagedModel {
   let port = allocate_port();
   let id = ModelId {
+    // Unique per launch: several fixtures share one test and the MRU keys on this.
     path: PathBuf::from(format!("/tmp/ls-pe-{port}.gguf")),
     header_blake3: [0u8; 32],
   };
-  let params = LaunchParams::new(PathBuf::from("/tmp/ls-pe.gguf"), LaunchMode::Chat);
   let plan = LlamaCppBackend::new().process_spec(&params, port, fake_binary(), fast_probe());
   let model = supervisor_spawn(ManagedSpawn {
     id,
@@ -100,6 +112,21 @@ async fn pre_launch(
   let launch_id = registry.next_id();
   registry.insert(launch_id, model.clone()).await;
   model
+}
+
+/// Poll `done` until it answers `Some`, then return it.
+async fn poll_until<T>(what: &str, done: impl Fn() -> Option<T>) -> T {
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    if let Some(v) = done() {
+      return v;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what} never happened"
+    );
+    sleep(Duration::from_millis(20)).await;
+  }
 }
 
 async fn build_state(registry: SupervisorRegistry, log_dir: &Path) -> Arc<ProxyState> {
@@ -641,5 +668,145 @@ async fn make_room_skips_a_candidate_that_took_a_request() {
   drop(_guard);
   assert_eq!(busy.inflight(), 0);
   let _ = busy.stop(Duration::from_secs(2)).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The eviction paths save a llama.cpp launch's prompt cache before the stop and the
+/// next launch of that model reads it back before it is Ready, so the returning
+/// conversation finds its prefix resident. This is the wiring between
+/// `eviction::stop_launch`'s save call, the file layout under the cache dir, and the
+/// readiness probe's restore; the fixture stands in for `llama-server`'s `/slots`
+/// save and restore endpoints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eviction_saves_the_prompt_cache_and_the_next_launch_restores_it() {
+  use llamastash::backend::llama_cpp::prompt_cache::{
+    prepare_launch_dir, LLAMACPP_KNOB_PROMPT_CACHE_DIR,
+  };
+  use llamastash::backend::llama_cpp::PromptCacheConfig;
+
+  let dir = unique_temp("prompt-cache");
+  std::env::set_var("LLAMASTASH_CACHE_DIR", dir.join("cache"));
+  let log_dir = dir.join("logs");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let registry = SupervisorRegistry::new();
+
+  let model_path = "/tmp/ls-pe-prompt-cache.gguf";
+  let mut params = LaunchParams::new(PathBuf::from(model_path), LaunchMode::Chat);
+  prepare_launch_dir(&PromptCacheConfig::default(), &mut params);
+  let slot_dir = PathBuf::from(
+    params
+      .launch_config
+      .get(LLAMACPP_KNOB_PROMPT_CACHE_DIR)
+      .expect("a chat launch gets a slot-save dir"),
+  );
+
+  let model = pre_launch_params(&log_dir, &registry, LaunchOrigin::AutoStart, params.clone()).await;
+  let (launch_id, _) = registry.snapshot().await.remove(0);
+  let row = llamastash::test_support::running_row(model_path)
+    .launch_id(launch_id.as_str())
+    .port(model.port())
+    .params(params.clone())
+    .origin(LaunchOrigin::AutoStart)
+    .build();
+  let persisted = PersistedState::new(
+    DaemonState {
+      running: vec![row],
+      ..Default::default()
+    },
+    None,
+  );
+  let state = build_state_with(registry.clone(), &log_dir, persisted).await;
+
+  // Nothing has been written before the sweep does its job.
+  assert!(!slot_dir.join("manifest.json").exists());
+
+  state.touch_mru(model.id()).await;
+  sleep(Duration::from_millis(5)).await;
+  eviction::sweep_once(&state, Duration::from_nanos(1)).await;
+
+  let manifest = poll_until("the slot manifest", || {
+    let body = std::fs::read_to_string(slot_dir.join("manifest.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let entries = v.get("entries")?.as_array()?;
+    (!entries.is_empty()).then(|| entries.clone())
+  })
+  .await;
+  assert_eq!(
+    manifest.len(),
+    1,
+    "one idle slot held a prompt: {manifest:?}"
+  );
+  let saved = &manifest[0];
+  assert_eq!(saved["slot"], 0);
+  assert_eq!(saved["n_tokens"], 4096);
+  let filename = saved["filename"].as_str().expect("a filename").to_string();
+  assert!(
+    slot_dir.join(&filename).is_file(),
+    "the fixture never received a save into {slot_dir:?}"
+  );
+  assert!(
+    !slot_dir.join("restores.log").exists(),
+    "a save must not itself restore anything"
+  );
+  // The busy slot's prompt (8192 tokens) is left alone: saving it would block the
+  // stop on a request that is still streaming.
+  assert!(
+    !slot_dir
+      .read_dir()
+      .unwrap()
+      .flatten()
+      .any(|e| e.file_name().to_string_lossy().starts_with("s1-")),
+    "a slot with a request in flight was saved"
+  );
+
+  // The next launch of the same model, with the same params, reads it back.
+  let second = pre_launch_params(&log_dir, &registry, LaunchOrigin::AutoStart, params).await;
+  let restores = poll_until("the restore call", || {
+    let body = std::fs::read_to_string(slot_dir.join("restores.log")).ok()?;
+    body
+      .contains(&format!("restore 0 {filename}"))
+      .then_some(body)
+  })
+  .await;
+  assert!(
+    matches!(second.state().await, ManagedState::Ready),
+    "a launch that restored a slot stayed out of Ready"
+  );
+  assert_eq!(restores.matches("restore ").count(), 1, "{restores}");
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A launch with no slot-save dir (`prompt_cache.enabled: false`, or a non-chat mode)
+/// saves nothing: the manifest never appears and the engine is never asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_without_a_prompt_cache_dir_saves_nothing() {
+  let dir = unique_temp("prompt-cache-off");
+  std::env::set_var("LLAMASTASH_CACHE_DIR", dir.join("cache"));
+  let log_dir = dir.join("logs");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let registry = SupervisorRegistry::new();
+  let model = pre_launch(&log_dir, &registry, LaunchOrigin::AutoStart).await;
+  let (launch_id, _) = registry.snapshot().await.remove(0);
+  let row = llamastash::test_support::running_row("/tmp/ls-pe.gguf")
+    .launch_id(launch_id.as_str())
+    .port(model.port())
+    .origin(LaunchOrigin::AutoStart)
+    .build();
+  let persisted = PersistedState::new(
+    DaemonState {
+      running: vec![row],
+      ..Default::default()
+    },
+    None,
+  );
+  let state = build_state_with(registry.clone(), &log_dir, persisted).await;
+  state.touch_mru(model.id()).await;
+  sleep(Duration::from_millis(5)).await;
+  eviction::sweep_once(&state, Duration::from_nanos(1)).await;
+  wait_until_not_ready(&model, "an uncacheable auto-start").await;
+  assert!(
+    !dir.join("cache/prompt-cache").exists(),
+    "a launch with no slot-save dir wrote a prompt cache anyway"
+  );
   std::fs::remove_dir_all(&dir).ok();
 }

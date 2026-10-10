@@ -82,6 +82,11 @@ backend: # Per-engine config, one block per backend. llama.cpp is the
     strict_fit: false # Refuse (vs degrade) an unplaceable --fit. Env: LLAMASTASH_STRICT_FIT.
     jinja: true # Emit --jinja every launch (tool calling). Config-only.
     map_anthropic_effort: true # Map Anthropic output_config.effort to the engine kwarg. Config-only.
+    prompt_cache: # Keep a conversation's prompt cache across an unload (llama.cpp, chat). Config-only.
+      enabled: true # Save on eviction, restore on launch. false = start cold every time.
+      min_tokens: 512 # Slots below this are not worth a file.
+      max_bytes: 4294967296 # Per-model disk budget; oldest saves are deleted over it.
+      max_age_secs: 21600 # Forget a saved cache after 6 hours.
   lemonade:
     # servers: [{ binary: /opt/lemonade/lemond }] # lemond path; else PATH.
     # enabled: # tri-state: unset=auto, true=force on, false=force off.
@@ -1492,6 +1497,30 @@ Every non-2xx response carries an OpenAI-shaped JSON body:
 | 503  | `launch_failed`                                              | Auto-start failed and no Ready models exist for fallback. `running: []` is always present on this arm. The list reflects models that were **in `Ready` state at the moment the proxy snapshotted the supervisor registry for fallback** — models in `Launching` / `Loading` are not included, so an empty list does not mean "the daemon has nothing alive," only "no candidate was available for instant fallback." Retry once the slow launch completes. |
 
 Upstream non-2xx responses (e.g. `llama-server` returns 500 for a malformed completion request) are passed through verbatim — same status code, same body bytes; the OpenAI-shape envelope above only covers errors the proxy itself emits. Mid-stream upstream death: once headers are sent the routing decision is committed; if the upstream stream errors after that point, the proxy closes its connection to the agent (the agent sees a truncated SSE / chunked body) — no retry, no fallback.
+
+### Prompt cache across an unload
+
+When the idle sweep or make-room unloads a llama.cpp model in the middle of a conversation, the next request to that model used to reprocess the whole prompt. Now the eviction writes the slot's prompt cache to disk first, and the next launch reads it back before it serves anything. On a 100k-token context that is the difference between about 48 minutes of reprocessing on a CPU and roughly a second of file read (measurements: [`spikes/2026-10-10-prompt-cache-across-unload.md`](spikes/2026-10-10-prompt-cache-across-unload.md)).
+
+What happens, for llama.cpp launches in chat mode only:
+
+- **Save, on eviction only.** Before the idle sweep or make-room stops a launch, every slot holding at least `backend.llamacpp.prompt_cache.min_tokens` prompt tokens is written to disk (`--slot-save-path` plus `POST /slots/{id_slot}?action=save`). A stop you asked for (`llamastash stop`, the TUI) saves nothing: that is the end of that conversation. A failed save is logged and the stop proceeds anyway, because the memory is the point of the stop.
+- **Restore, before the launch is Ready.** A child that comes up reads back the saved slots it may use and then answers its first request. A restore that the engine refuses (a window too small, a KV layout that differs) is dropped and logged, never retried into the same wall.
+- **Matching is the engine's.** The follow-up needs no hints from the client: `llama-server` routes a request to the slot whose prompt shares the longest common prefix with it (`--slot-prompt-similarity`, default 0.1) and reuses only the tokens the two prompts actually have in common. A cache left from a conversation that never comes back is therefore never wrong, just unused, until it ages out.
+- **Where the files live.** `<cache_dir>/prompt-cache/llamacpp/<model>/`, one directory per model and mode, with a `manifest.json` index beside the saves. `max_bytes` is the per-directory budget (oldest saves are deleted first), `max_age_secs` the expiry. The directory is mode `0700`, because a save holds what the conversation said; deleting it by hand is always safe. Nothing outside that directory is ever touched.
+- **What makes a cache reusable.** A save is only read back into a launch whose server arguments agree about what the cached bytes mean: KV cache types, flash attention, slot count, speculative decoding, RoPE settings, and any `extras` all count, and so does the `llama-server` build. Which device the model runs on and how large its context window is do not void a cache, and `llama-server` itself rejects a file that cannot fit the window it is given.
+
+```yaml
+backend:
+  llamacpp:
+    prompt_cache:
+      enabled: true        # Default true. false never saves and never restores.
+      min_tokens: 512      # Below this a slot is not worth a file.
+      max_bytes: 4294967296 # Per model directory; oldest saves go first over the budget.
+      max_age_secs: 21600  # 6 hours.
+```
+
+A 100k-token context costs about 3 GiB per saved slot at the default KV type (1.7 GiB with `-ctk q8_0 -ctv q8_0`), so the byte budget is the number to tune if you would rather have more conversations resident than a small cache dir. `llamastash status --json` does not report the cache; the daemon log says what it saved and restored, per launch.
 
 ### Configuration
 

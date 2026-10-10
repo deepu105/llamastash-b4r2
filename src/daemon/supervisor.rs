@@ -675,6 +675,13 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
           }
         }
         *probe_model.inner.actuals.write().await = actuals;
+        // Put any saved prompt cache back before the first request can land: the
+        // engine restores into an idle slot, and a request that arrived first would
+        // both delay that and end up paying for the prompt itself. Only a backend
+        // with such a cache does anything, and it does nothing when there is none.
+        probe_backend
+          .restore_prompt_cache(probe_model.inner.port, probe_model.params())
+          .await;
         let secs = SystemTime::now()
           .duration_since(UNIX_EPOCH)
           .map(|d| d.as_secs())
