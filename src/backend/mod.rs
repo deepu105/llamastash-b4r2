@@ -424,6 +424,24 @@ pub trait Backend {
     crate::daemon::actuals::Actuals::default()
   }
 
+  /// Best-effort prompt-cache preservation while the engine is still healthy,
+  /// called by proxy eviction just **before** the launch's `stop`, so a launch
+  /// stopped mid-conversation (idle sweep, make-room) can hand its KV state to
+  /// the next launch. Manual stops and daemon shutdown skip it: they are not
+  /// mid-conversation evictions and must stay fast. Default no-op — a backend
+  /// that cannot hand cache across a restart pays nothing. llama.cpp overrides
+  /// to save each idle slot's prompt cache to disk; the eviction paths stay
+  /// backend-neutral.
+  async fn prepare_to_stop(&self, _port: u16, _params: &LaunchParams) {}
+
+  /// Best-effort prompt-cache restore, called by the readiness probe after the
+  /// engine answers its health endpoint but **before** the launch is marked
+  /// `Ready` — so no request can race the restore, slots are idle, and the
+  /// first forwarded request sees a warm cache (at the cost of the restore
+  /// time, which is what makes the reprocess it replaces worth skipping).
+  /// Default no-op; llama.cpp overrides to reload its saved slot files.
+  async fn on_launch_ready(&self, _port: u16, _params: &LaunchParams) {}
+
   /// Whether `extras` already configures speculative decoding by hand, in which
   /// case llamastash defers entirely and adds none of its own (KD3).
   ///
@@ -1171,6 +1189,14 @@ impl Backend for Backends {
     timeout: std::time::Duration,
   ) -> crate::daemon::actuals::Actuals {
     for_each_backend!(self, b => b.fetch_actuals(port, timeout).await)
+  }
+
+  async fn prepare_to_stop(&self, port: u16, params: &LaunchParams) {
+    for_each_backend!(self, b => b.prepare_to_stop(port, params).await)
+  }
+
+  async fn on_launch_ready(&self, port: u16, params: &LaunchParams) {
+    for_each_backend!(self, b => b.on_launch_ready(port, params).await)
   }
 
   fn speculation_set_in_extras(&self, extras: &[OsString]) -> bool {

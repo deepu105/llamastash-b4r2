@@ -226,6 +226,12 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
 async fn stop_launch(ctx: &crate::daemon::context::MethodContext, launch_id: &LaunchId) {
   use crate::backend::Backend;
   let backend = crate::daemon::launch_service::backend_for_launch(ctx, launch_id).await;
+  // Give the backend a last chance to hand state (e.g. a chat prompt cache)
+  // to the next launch while its server still answers. No-ops unless the
+  // backend opted in, and bounds its own work.
+  if let Some(model) = ctx.supervisors.get(launch_id).await {
+    backend.prepare_to_stop(model.port(), model.params()).await;
+  }
   let _ = backend
     .stop(ctx, launch_id, EVICT_STOP_GRACE.as_secs())
     .await;

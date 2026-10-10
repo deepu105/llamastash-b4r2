@@ -675,6 +675,13 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
           }
         }
         *probe_model.inner.actuals.write().await = actuals;
+        // Hand back any prompt cache a previous launch of this model left
+        // behind before publishing Ready: the slots are guaranteed idle here
+        // (no request can route yet) and the first request finds a warm
+        // cache. Best-effort; the backend bounds its own budget.
+        probe_backend
+          .on_launch_ready(probe_model.inner.port, &probe_model.inner.params)
+          .await;
         let secs = SystemTime::now()
           .duration_since(UNIX_EPOCH)
           .map(|d| d.as_secs())

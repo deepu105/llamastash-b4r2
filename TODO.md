@@ -428,7 +428,7 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 4: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
-- [ ] Keep a model's prompt cache across an unload
+- [x] ~~Keep a model's prompt cache across an unload~~ — **done 2026-10-10**: `backend.llamacpp.slot_cache` (off by default) saves idle slots' KV to the cache dir before an eviction stop and restores it before `Ready`; numbers and go decision in `docs/spikes/2026-10-10-prompt-cache-slot-save.md`.
 - [ ] Warm the page cache before a load (`llamastash warm <model>`)
 
 ### Batch 5: CLI setup commands ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-5-cli-setup-commands))
