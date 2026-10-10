@@ -226,6 +226,10 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
 async fn stop_launch(ctx: &crate::daemon::context::MethodContext, launch_id: &LaunchId) {
   use crate::backend::Backend;
   let backend = crate::daemon::launch_service::backend_for_launch(ctx, launch_id).await;
+  // Eviction is the one stop that may strand a conversation: give the
+  // backend its persist-state hook first (llama.cpp saves idle slots' KV;
+  // every other backend no-ops) while the engine is still answering HTTP.
+  backend.before_stop(ctx, launch_id).await;
   let _ = backend
     .stop(ctx, launch_id, EVICT_STOP_GRACE.as_secs())
     .await;

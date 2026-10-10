@@ -17,6 +17,7 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+mod prompt_cache;
 mod telemetry;
 
 use compose::compose;
@@ -49,6 +50,14 @@ pub const LLAMACPP_KNOB_FIT_CTX_FLOOR: &str = "fit_ctx_floor";
 pub const LLAMACPP_KNOB_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
 /// The same fact as a [`caps`] probe key on `Server::caps`.
 pub const CAP_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
+/// `launch_config` key carrying the per-model `--slot-save-path` directory
+/// this launch was seeded with (the `prompt_cache` module). Written by
+/// [`LlamaCppBackend::seed_launch_knobs`]; `compose` and the save/restore
+/// hooks read it only together with [`LLAMACPP_KNOB_PROMPT_CACHE_SUPPORTED`].
+pub const LLAMACPP_KNOB_PROMPT_CACHE_DIR: &str = "prompt_cache_dir";
+/// `launch_config` key recording that the resolved binary serves the slot
+/// save/restore actions. Written by `seed_binary_caps`, read by `compose`.
+pub const LLAMACPP_KNOB_PROMPT_CACHE_SUPPORTED: &str = "prompt_cache_supported";
 
 /// The `fit_ctx_floor` launch knob parsed to `u32`, or `None` when unseeded /
 /// unparsable. Shared by the admission-floor and readiness-gate hooks.
@@ -57,6 +66,23 @@ fn fit_ctx_floor_knob(params: &LaunchParams) -> Option<u32> {
     .launch_config
     .get(LLAMACPP_KNOB_FIT_CTX_FLOOR)
     .and_then(|s| s.parse::<u32>().ok())
+}
+
+/// The `--slot-save-path` dir this launch was seeded with, present only when
+/// the feature was on at seed time and the resolved binary serves the slot
+/// actions — the same pair of `launch_config` markers `compose` gates the
+/// flag on, so the argv and the save/restore hooks can never disagree.
+fn prompt_cache_dir(params: &LaunchParams) -> Option<PathBuf> {
+  let dir = params.launch_config.get(LLAMACPP_KNOB_PROMPT_CACHE_DIR)?;
+  if params
+    .launch_config
+    .get(LLAMACPP_KNOB_PROMPT_CACHE_SUPPORTED)
+    .map(String::as_str)
+    != Some("true")
+  {
+    return None;
+  }
+  Some(PathBuf::from(dir))
 }
 
 /// Environment variables removed before spawning `llama-server`.
@@ -160,10 +186,27 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Keep an evicted launch's prompt cache across the reload: launches run
+  /// with `--slot-save-path`, the KV cache is saved as an eviction stops the
+  /// launch, and the next launch of that model restores it instead of
+  /// reprocessing the conversation. Factory `true`; see
+  /// `docs/architecture.md` § Model lifecycle and the `prompt_cache`
+  /// module for the file layout and cleanup.
+  #[serde(default = "default_true")]
+  pub prompt_cache: bool,
+  /// Total size cap, in MiB, over the saved KV files of all models under
+  /// `cache_dir/prompt-cache/`. Pruning is oldest-first; the newest save is
+  /// kept even if it alone exceeds the cap. Factory `8192`.
+  #[serde(default = "default_prompt_cache_max_mb")]
+  pub prompt_cache_max_mb: u32,
 }
 
 fn default_true() -> bool {
   true
+}
+
+fn default_prompt_cache_max_mb() -> u32 {
+  8192
 }
 
 fn default_fit_ctx_floor() -> u32 {
@@ -178,6 +221,8 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      prompt_cache: true,
+      prompt_cache_max_mb: default_prompt_cache_max_mb(),
     }
   }
 }
@@ -375,17 +420,29 @@ impl Backend for LlamaCppBackend {
 
   fn probe_caps(&self, binary: &Path) -> std::collections::BTreeMap<String, String> {
     let mut caps = std::collections::BTreeMap::new();
+    // One `--help` run answers both questions about this build.
+    let help = caps::help_text(binary).unwrap_or_default();
     caps.insert(
       CAP_LOAD_MODE_DIALECT.to_string(),
-      caps::LoadModeDialect::probe(binary).label().to_string(),
+      caps::LoadModeDialect::from_help(&help).label().to_string(),
+    );
+    caps.insert(
+      prompt_cache::CAP_SLOT_SAVE_PATH.to_string(),
+      caps::help_adverts_slot_save_path(&help).to_string(),
     );
     caps
   }
 
   fn seed_binary_caps(&self, binary: &Path, servers: &[super::Server], params: &mut LaunchParams) {
-    let dialect = match servers.iter().find(|s| s.binary == binary) {
-      Some(server) => caps::LoadModeDialect::from_label(
-        server.caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str),
+    let (dialect, slot_save_path) = match servers.iter().find(|s| s.binary == binary) {
+      Some(server) => (
+        caps::LoadModeDialect::from_label(
+          server.caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str),
+        ),
+        server
+          .caps
+          .get(prompt_cache::CAP_SLOT_SAVE_PATH)
+          .is_some_and(|v| v == "true"),
       ),
       // The binary should always be a catalog row (`configured_servers` adds the
       // daemon's resolved default), so a miss means the catalog and the launch
@@ -396,12 +453,20 @@ impl Backend for LlamaCppBackend {
           "{} is not in the server catalog; probing its flags directly",
           binary.display()
         );
-        caps::LoadModeDialect::probe(binary)
+        let help = caps::help_text(binary).unwrap_or_default();
+        (
+          caps::LoadModeDialect::from_help(&help),
+          caps::help_adverts_slot_save_path(&help),
+        )
       }
     };
     params.launch_config.insert(
       LLAMACPP_KNOB_LOAD_MODE_DIALECT.to_string(),
       dialect.label().to_string(),
+    );
+    params.launch_config.insert(
+      LLAMACPP_KNOB_PROMPT_CACHE_SUPPORTED.to_string(),
+      slot_save_path.to_string(),
     );
   }
 
@@ -463,6 +528,52 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+    // Cross-restart prompt cache: prepare the per-model slot-save dir so
+    // `compose` can pass `--slot-save-path` (the binary's own support is
+    // folded in later by `seed_binary_caps`; both markers gate the flag,
+    // the save, and the restore). Dropped under the bench parity escape
+    // hatch like `--jinja` — Suite A compares argv against raw
+    // `llama-server`.
+    params.launch_config.remove(LLAMACPP_KNOB_PROMPT_CACHE_DIR);
+    if cfg.prompt_cache
+      && cfg.prompt_cache_max_mb > 0
+      && !crate::launch::params::bench_disable_defaults_from_env()
+    {
+      if let Some(dir) = prompt_cache::prepare_dir(&params.model_path) {
+        params.launch_config.insert(
+          LLAMACPP_KNOB_PROMPT_CACHE_DIR.to_string(),
+          dir.display().to_string(),
+        );
+      }
+    }
+  }
+
+  /// Persist idle slots' KV to this launch's prompt cache dir just before a
+  /// proxy eviction stops it, so the next launch restores the conversation
+  /// instead of reprocessing it. No-op for a launch that was never seeded
+  /// for the cache (feature off, old build, bench parity).
+  async fn before_stop(&self, ctx: &MethodContext, launch_id: &crate::daemon::registry::LaunchId) {
+    let Some(model) = ctx.supervisors.get(launch_id).await else {
+      return;
+    };
+    let Some(dir) = prompt_cache_dir(model.params()) else {
+      return;
+    };
+    let cap_bytes = (ctx.backend.llamacpp.prompt_cache_max_mb as u64) << 20;
+    // The cap is global across models, so prune from the shared parent dir.
+    let root = dir.parent().unwrap_or(dir.as_path());
+    prompt_cache::save_idle_slots(model.port(), &dir, root, cap_bytes).await;
+  }
+
+  /// Read the saved KV back into a fresh server after its readiness probe
+  /// passed, before the supervisor announces `Ready` — the request that
+  /// brought the model back then hits warm slots instead of racing a
+  /// restore that still lands.
+  async fn after_ready(&self, port: u16, params: &LaunchParams) {
+    let Some(dir) = prompt_cache_dir(params) else {
+      return;
+    };
+    prompt_cache::restore_slots(port, &dir).await;
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {
@@ -685,6 +796,75 @@ mod tests {
   }
 
   // ---- Unified `llama` app: the `serve` subcommand ----
+
+  #[test]
+  fn prompt_cache_flag_needs_dir_and_binary_support() {
+    let mut p = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
+    let has = |argv: &[OsString], flag: &str| argv.iter().any(|a| a == flag);
+    assert!(
+      !has(&compose(&p, 41100), "--slot-save-path"),
+      "clean params emit nothing"
+    );
+
+    p.launch_config.insert(
+      LLAMACPP_KNOB_PROMPT_CACHE_DIR.to_string(),
+      "/cache/prompt-cache/m".into(),
+    );
+    assert!(
+      !has(&compose(&p, 41100), "--slot-save-path"),
+      "the dir alone (binary support unprobed) emits nothing"
+    );
+
+    p.launch_config.insert(
+      LLAMACPP_KNOB_PROMPT_CACHE_SUPPORTED.to_string(),
+      "true".into(),
+    );
+    p.extras.push(OsString::from("--seed"));
+    p.extras.push(OsString::from("7"));
+    let argv = compose(&p, 41100);
+    let flag = argv
+      .iter()
+      .position(|a| a == "--slot-save-path")
+      .expect("both markers emit the flag");
+    assert_eq!(argv[flag + 1], "/cache/prompt-cache/m");
+    let extras_at = argv
+      .iter()
+      .position(|a| a == "--seed")
+      .expect("extras still emitted");
+    assert!(flag < extras_at, "extras keep last-occurrence precedence");
+
+    // The save/restore hooks gate on exactly the argv gate.
+    assert_eq!(
+      prompt_cache_dir(&p),
+      Some(PathBuf::from("/cache/prompt-cache/m"))
+    );
+    p.launch_config.insert(
+      LLAMACPP_KNOB_PROMPT_CACHE_SUPPORTED.to_string(),
+      "false".into(),
+    );
+    assert_eq!(prompt_cache_dir(&p), None);
+  }
+
+  #[test]
+  fn seed_binary_caps_records_slot_support_even_for_an_uncataloged_binary() {
+    // No catalog row: the probe runs against the binary; one that cannot
+    // answer `--help` degrades to no slot support (and the old flags),
+    // never to a flag the engine would reject.
+    let mut p = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
+    LlamaCppBackend::new().seed_binary_caps(Path::new("/nonexistent/llama-server"), &[], &mut p);
+    assert_eq!(
+      p.launch_config
+        .get(LLAMACPP_KNOB_PROMPT_CACHE_SUPPORTED)
+        .map(String::as_str),
+      Some("false")
+    );
+    assert_eq!(
+      p.launch_config
+        .get(LLAMACPP_KNOB_LOAD_MODE_DIALECT)
+        .map(String::as_str),
+      Some("flags")
+    );
+  }
 
   #[test]
   fn serve_prefix_is_keyed_on_the_binary_name() {

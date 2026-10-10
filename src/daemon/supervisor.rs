@@ -675,6 +675,13 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
           }
         }
         *probe_model.inner.actuals.write().await = actuals;
+        // Let the backend load back state it persisted at the last eviction
+        // (llama.cpp's prompt cache; a no-op for everything else). Before the
+        // Ready transition so no request can land on half-restored slots;
+        // best-effort by contract, so it cannot fail the launch.
+        probe_backend
+          .after_ready(probe_model.port(), probe_model.params())
+          .await;
         let secs = SystemTime::now()
           .duration_since(UNIX_EPOCH)
           .map(|d| d.as_secs())

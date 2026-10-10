@@ -121,6 +121,24 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
     knob_argv.push(sel.into());
   }
   argv.extend(knob_argv);
+  // Cross-restart prompt cache: point the engine at this launch's slot-save
+  // dir. Emitted only when the seed prepared the dir *and* the resolved
+  // binary serves the actions (`seed_launch_knobs` / `seed_binary_caps`) —
+  // the same pair the save/restore hooks gate on. Before `extras` so an
+  // extras copy still wins by llama-server's last-occurrence rule.
+  if let (Some(dir), Some("true")) = (
+    params
+      .launch_config
+      .get(super::LLAMACPP_KNOB_PROMPT_CACHE_DIR)
+      .map(String::as_str),
+    params
+      .launch_config
+      .get(super::LLAMACPP_KNOB_PROMPT_CACHE_SUPPORTED)
+      .map(String::as_str),
+  ) {
+    argv.push("--slot-save-path".into());
+    argv.push(dir.into());
+  }
   // Defensive strip: refuse to pass loopback-breaking flags even if
   // an upstream validator was skipped. Last-occurrence semantics in
   // llama-server mean a single `--host 0.0.0.0` here would override
