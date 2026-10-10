@@ -545,6 +545,38 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     map_anthropic_effort: true
 
+    # Keep a launch's prompt cache across an unload (default: off). When the
+    # idle sweep or make-room unloads a llama.cpp chat launch, the daemon
+    # first asks llama-server to write each slot's KV cache to a file, and
+    # reads the files back when a launch with the same arguments turns ready.
+    # The next request in that conversation then skips prompt processing:
+    # measured at 100k tokens, a restore took about 0.5 to 1.3 s where
+    # reprocessing took 50 s on a GPU and 48 min on a CPU.
+    #
+    # The cost is disk. One save is about 33 KB per token on a 1B model
+    # (3 GiB at 100k tokens) and more on a larger model. A file is deleted
+    # once it has been restored, so the directory holds only the caches of
+    # launches that are unloaded right now. The files contain the
+    # conversation's tokens; the directory is created owner-only (0700).
+    #
+    # A manual `stop` and a daemon shutdown save nothing. Turning this on adds
+    # `--slot-save-path` to chat launches; a launch that passes its own
+    # `--slot-save-path` is left alone.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    slot_cache:
+      enabled: false
+      # Where the files go. Default: `<cache dir>/slot-cache`
+      # (`~/.cache/llamastash/slot-cache` on Linux). Do not point it at a RAM
+      # disk.
+      # dir: /var/tmp/llamastash-slots
+      # Cap on the total size of all saved files, in GiB. After each save the
+      # oldest files are deleted until the total fits. A save is skipped when
+      # the disk has less than this much free.
+      max_gib: 16
+      # A file older than this is deleted instead of restored. Default 24 h.
+      max_age_secs: 86400
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend

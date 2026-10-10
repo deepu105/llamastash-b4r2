@@ -643,3 +643,147 @@ async fn make_room_skips_a_candidate_that_took_a_request() {
   let _ = busy.stop(Duration::from_secs(2)).await;
   std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Spawn a launch whose params were seeded with the slot cache on, rooted at
+/// `root`. Two calls build the same argv apart from the port, as an eviction
+/// followed by the next auto-start does.
+async fn launch_with_slot_cache(
+  log_dir: &Path,
+  root: &Path,
+  model_file: &Path,
+  registry: &SupervisorRegistry,
+) -> ManagedModel {
+  use llamastash::backend::Backend;
+  let mut ctx = MethodContext::with_catalog(ShutdownToken::new(), ModelCatalog::new());
+  ctx.backend.llamacpp.slot_cache.enabled = true;
+  ctx.backend.llamacpp.slot_cache.dir = Some(root.to_path_buf());
+  // A save needs a cap's worth of free disk; keep that small for CI runners.
+  ctx.backend.llamacpp.slot_cache.max_gib = 1;
+  let mut params = LaunchParams::new(model_file.to_path_buf(), LaunchMode::Chat);
+  let backend = LlamaCppBackend::new();
+  backend.seed_launch_knobs(&ctx, &mut params);
+  let port = allocate_port();
+  let plan = backend.process_spec(&params, port, fake_binary(), fast_probe());
+  let model = supervisor_spawn(ManagedSpawn {
+    id: ModelId {
+      path: model_file.to_path_buf(),
+      header_blake3: [0u8; 32],
+    },
+    params,
+    port,
+    mode: LaunchMode::Chat,
+    log_path: log_dir.join(format!("slot-{port}.log")),
+    plan,
+    origin: LaunchOrigin::AutoStart,
+    fit_gate: None,
+    resolved_backend: "llamacpp".to_string(),
+  })
+  .await
+  .expect("spawn");
+  wait_for_ready(&model).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+  model
+}
+
+fn slot_files(root: &Path) -> Vec<String> {
+  std::fs::read_dir(root)
+    .into_iter()
+    .flatten()
+    .flatten()
+    .map(|f| f.file_name().into_string().unwrap())
+    .collect()
+}
+
+/// The sweep saves the launch's slots before it stops it, and the next launch
+/// with the same argv reads them back before it turns `Ready` and deletes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_evicted_launch_saves_its_slots_and_the_next_launch_restores_them() {
+  let dir = unique_temp("slot-cache");
+  let log_dir = dir.join("logs");
+  let root = dir.join("slot-cache");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let model_file = dir.join("model.gguf");
+  std::fs::write(&model_file, b"weights").unwrap();
+  let registry = SupervisorRegistry::new();
+  let first = launch_with_slot_cache(&log_dir, &root, &model_file, &registry).await;
+  assert!(
+    slot_files(&root).is_empty(),
+    "a first launch has nothing to restore"
+  );
+  let state = build_state(registry.clone(), &log_dir).await;
+  state.touch_mru(first.id()).await;
+  sleep(Duration::from_millis(5)).await;
+
+  eviction::sweep_once(&state, Duration::from_nanos(1)).await;
+  wait_until_not_ready(&first, "the idle sweep").await;
+
+  let files = slot_files(&root);
+  assert_eq!(files.len(), 1, "{files:?}");
+  assert!(files[0].ends_with("-model.slot-0.bin"), "{files:?}");
+
+  let second = launch_with_slot_cache(&log_dir, &root, &model_file, &registry).await;
+  assert_ne!(second.port(), first.port());
+  assert!(
+    slot_files(&root).is_empty(),
+    "a restored file is deleted before the launch is Ready"
+  );
+  let log = std::fs::read_to_string(second.log_path()).unwrap();
+  assert!(
+    log.contains(&format!("fake slot restore: {} n_restored=4242", files[0])),
+    "{log}"
+  );
+  let _ = second.stop(Duration::from_secs(2)).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A manual stop is not an eviction: nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manual_stop_saves_nothing() {
+  let dir = unique_temp("slot-cache-manual");
+  let log_dir = dir.join("logs");
+  let root = dir.join("slot-cache");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let model_file = dir.join("model.gguf");
+  std::fs::write(&model_file, b"weights").unwrap();
+  let registry = SupervisorRegistry::new();
+  let model = launch_with_slot_cache(&log_dir, &root, &model_file, &registry).await;
+
+  let _ = model.stop(Duration::from_secs(2)).await;
+  wait_until_not_ready(&model, "a manual stop").await;
+
+  assert!(slot_files(&root).is_empty());
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Make-room unloads through the same hook as the sweep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn make_room_saves_the_slots_of_a_launch_it_unloads() {
+  let dir = unique_temp("slot-cache-make-room");
+  let log_dir = dir.join("logs");
+  let root = dir.join("slot-cache");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let model_file = dir.join("model.gguf");
+  std::fs::write(&model_file, b"weights").unwrap();
+  let registry = SupervisorRegistry::new();
+  let model = launch_with_slot_cache(&log_dir, &root, &model_file, &registry).await;
+  let persisted = PersistedState::new(DaemonState::default(), None);
+  stamp_row(&persisted, &registry, &model, None, 500).await;
+  let state =
+    build_state_with_presets(registry, &log_dir, persisted, ConfigPresetStore::empty()).await;
+
+  let fits = eviction::make_room(
+    &state,
+    &Refusal {
+      demand_bytes: 400,
+      effective_free_bytes: 100,
+      reserved_bytes: 0,
+    },
+    |_| {},
+  )
+  .await;
+
+  assert!(fits);
+  wait_until_not_ready(&model, "make-room").await;
+  assert_eq!(slot_files(&root).len(), 1);
+  std::fs::remove_dir_all(&dir).ok();
+}

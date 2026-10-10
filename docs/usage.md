@@ -82,6 +82,11 @@ backend: # Per-engine config, one block per backend. llama.cpp is the
     strict_fit: false # Refuse (vs degrade) an unplaceable --fit. Env: LLAMASTASH_STRICT_FIT.
     jinja: true # Emit --jinja every launch (tool calling). Config-only.
     map_anthropic_effort: true # Map Anthropic output_config.effort to the engine kwarg. Config-only.
+    slot_cache: # Keep the prompt cache across an idle unload. See §"Prompt cache across an unload".
+      enabled: false # Off by default: one save is GiB-sized at long contexts.
+      # dir: ~/.cache/llamastash/slot-cache # Default: <cache dir>/slot-cache.
+      max_gib: 16 # Cap on all saved files together; oldest deleted first.
+      max_age_secs: 86400 # Older files are deleted instead of restored.
   lemonade:
     # servers: [{ binary: /opt/lemonade/lemond }] # lemond path; else PATH.
     # enabled: # tri-state: unset=auto, true=force on, false=force off.
@@ -617,6 +622,27 @@ Beside its launch settings an entry can pin how long it stays loaded and whether
 - `preload: true` — start this preset when the daemon boots. Same as naming it in `daemon.preload`, and the same exemption applies: a preloaded launch is manual intent, so it stays up until you stop it. The preset's key has to name **one** model: a preloaded launch can never be unloaded, so an arch or wide-glob key (which would pin every model it matches) is skipped at boot with a line in the daemon log — name the model, or list them under `daemon.preload` in the order you want them.
 
 A re-save that says nothing about residency keeps whatever the name already pins, even when the save lands under the model's own key and shadows an arch or glob entry of the same name; `--no-idle-ttl` / `--no-preload` are the only way to drop a pin. The one exception is `preload`: a family key's `preload: true` is not carried onto a single-model key, because boot refuses to preload a family and a preloaded launch can never be unloaded — so a `Ctrl+P` recapture cannot start loading your model at boot behind your back. The sweep reads the TTL from the daemon's live preset store on every pass, so `presets save --idle-ttl` moves a running launch's deadline without a relaunch; a hand edit to `config.yaml` needs `daemon restart`, like any other hand edit. When a request cannot be admitted because the host is full, the daemon first tries to make room by unloading idle auto-started launches, least-recently-used first (see §Proxy); launches pinned to `idle_ttl_secs: 0`, launches with a request in flight, and manual or preloaded launches are never picked.
+
+#### Prompt cache across an unload
+
+An unload normally throws away the model's prompt cache, so the next request in a long conversation reprocesses the whole prompt. With `backend.llamacpp.slot_cache.enabled: true` the daemon keeps it on disk instead:
+
+- **Save.** Right before the idle sweep or make-room unloads a llama.cpp chat launch, the daemon asks `llama-server` to write every slot that holds tokens to a file (`POST /slots/{id}?action=save`). A manual `stop`, `stop --all`, a daemon stop and a crash save nothing.
+- **Restore.** When a launch with the same arguments turns ready, the files are read back into the same slot ids before the launch takes its first request, then deleted. `llama-server` routes a request to the slot whose cached prompt shares the longest prefix with it, so the returning conversation finds its cache on its own.
+- **Same arguments** means the same `llama-server` argv apart from the port, and the same model file (size and modification time). A different context size, preset or cache type gets its own files and does not read another launch's.
+- **Where.** `<cache dir>/slot-cache` (`~/.cache/llamastash/slot-cache` on Linux), or `slot_cache.dir`. The directory is created owner-only: the files hold the conversation's tokens.
+- **Limits.** `max_gib` (default 16) caps the total; after each save the oldest files are deleted until it fits, and a save is skipped when the disk has less than `max_gib` free. A file older than `max_age_secs` (default 24 h) is deleted instead of restored.
+
+Size and time, measured on `Llama-3.2-1B-Instruct-Q4_K_M` at 100k tokens: the file is 3.05 GiB (about 32.8 KB per token), a save takes 0.3 to 2.7 s and a restore 0.3 to 1.3 s, against 50 s to 53 min to reprocess the prompt. A larger model writes a larger file per token. Full numbers: [`docs/spikes/2026-10-10-slot-save-restore.md`](spikes/2026-10-10-slot-save-restore.md).
+
+What it does not cover:
+
+- Only what sits in a slot at the moment of the unload is saved. `llama-server` moves an idle slot into its in-RAM prompt cache (`--cache-ram`) when another conversation needs a slot, and that cache is lost with the process.
+- The size of a save is not known before it is written. A save larger than `max_gib` is written and then deleted.
+- Turning the setting off stops new saves but does not delete files already written. Remove the directory by hand.
+- The daemon log (`llamastash.log`) records each save and restore with its token count, size and time. `status` does not show them.
+
+The proxy's `/ui` route answers `403` to a `POST` under `/slots/`, so the slot save, restore and erase actions of `llama-server` are not reachable through the proxy.
 
 ### `llamastash favorites`
 

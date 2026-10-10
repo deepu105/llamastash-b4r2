@@ -175,6 +175,7 @@ A new backend is **one new module plus the minimum central wiring**; removing on
 | `init` adopt-path hint | `binary_serves` decides whether a hand-picked path looks like a server, so `init` names no binary of its own |
 | TUI display | generic id chip; the editor and the running knob view are both generated from `Backend::knobs()`; `DEFAULT_BACKEND_ID` / `default_backend` / `BackendChoice::from_id` cover the "default backend" and id→choice sites |
 | Non-replayable knobs | `KnobDef.volatile` marks a knob a backend treats as a here-and-now judgement rather than a preference; `knobs_for_persist` drops them (alongside the daemon's own `auto_set`) so a one-off `--preset` cannot silently become permanent |
+| Keeping state across an eviction | `before_evict` runs before the idle sweep or make-room stops a launch, `after_ready` on Loading → Ready before the launch is reported `Ready`. Both default to no-op; `proxy::eviction` and the supervisor's probe task call them on the launch's own backend and name no endpoint |
 | Config-derived launch knobs | `seed_launch_knobs` projects a backend's own config into the generic `launch_config` map, read back only by that backend's `compose` / `admission_ctx_floor` / `readiness_fit_gate` — so no backend knob name rides the neutral launch IR |
 
 `BackendChoice` (`src/launch/params.rs`) is `Auto | Explicit(String)`, so a backend id is just data: `--backend <id>` validates against the registry (`cli_args::parse_backend_id`) and the wire form is the bare id string. Neutrality guards: `routed_backend_for` with a synthetic id, and `backends_forward_defaulted_methods_to_variants`.
@@ -360,6 +361,17 @@ stateDiagram-v2
 A Ready process that exits without a stop request (a crash, the kernel OOM killer) goes to `Error`, with its exit code or signal and its last log lines as the cause. The row stays in `status` and the TUI until the user stops it; the proxy skips it, and a new request auto-starts a replacement.
 
 Each launch is owned by a `ManagedModel`. The supervisor health-probes `/health` every 500 ms during `Loading`; transitions to `Ready` on first 200 OK. After Ready, a longer 30 s liveness re-check runs in the background.
+
+**Prompt cache across an eviction (llama.cpp, opt-in).** With `backend.llamacpp.slot_cache.enabled`, a chat launch gets `--slot-save-path <root>`. The two paths that unload an idle launch, `sweep_once` and `make_room` in `src/proxy/eviction.rs`, call `Backend::before_evict` between two busy checks; llama.cpp's implementation (`src/backend/llama_cpp/slot_cache.rs`) saves every non-empty slot through `POST /slots/{id}?action=save`. On the next launch the supervisor's probe task calls `Backend::after_ready` before the `Ready` transition, which restores each file into the slot id it came from and deletes it. The decisions:
+
+- **When.** Before an eviction only. A manual stop, a daemon shutdown and a crash save nothing: the first two are the user asking for the model to go, and a save on every stop would write GiB-sized files nobody reads.
+- **Where.** One flat directory, `<cache dir>/slot-cache` (or `slot_cache.dir`), mode `0700`, created when the launch is seeded because `llama-server` exits at startup if it is missing. A file is `<key>-<model-stem>.slot-<id>.bin`. `key` is 16 hex digits of a BLAKE3 hash over the launch argv composed for port `0` plus the model file's size and mtime, so a launch only reads files a launch of the same shape wrote. The engine writes to `<name>.part` and the daemon renames it after a `200`, so a save cut short is never restored.
+- **Cap and cleanup.** A restored file is deleted, whether the restore worked or not, so the directory holds only the caches of launches that are unloaded right now. After every save, files older than `max_age_secs` are deleted, then the oldest files until the total is under `max_gib`. A save is skipped when the disk has less than `max_gib` free, because the size of a save is not known until it is written.
+- **Matching.** Nothing in the proxy. `llama-server` picks the slot for a request by longest common prompt prefix (`--slot-prompt-similarity`, default `0.10`), so restoring each file into its original slot id is enough for the returning conversation to land on it.
+
+With the flag set, `llama-server` also accepts the slot actions from anyone who reaches its port, so `/ui`, the one proxy route that forwards arbitrary upstream paths, refuses a `POST` under `/slots/` (`is_slot_action` in `src/proxy/ui.rs`).
+
+The settings reach the hooks through `launch_config` (seeded by `seed_launch_knobs`), since neither hook has the daemon config in reach. Numbers and the engine behaviour this relies on: [`docs/spikes/2026-10-10-slot-save-restore.md`](spikes/2026-10-10-slot-save-restore.md).
 
 Per-launch logs are tee'd to a 10 MB × 5-file rotating log on disk and a 4K-line in-memory ring buffer so the TUI's Logs tab and the `logs_tail` IPC method don't need to re-open files.
 
