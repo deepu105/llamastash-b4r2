@@ -675,6 +675,13 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
           }
         }
         *probe_model.inner.actuals.write().await = actuals;
+        // Backend warm-keeping hook (e.g. restoring a prompt cache from disk)
+        // while the server answers health checks but before any caller can
+        // route traffic to it. Best-effort: the backend logs its own
+        // failures and a failed warm is just a cold first request.
+        probe_backend
+          .before_ready(probe_model.inner.port, &probe_model.inner.params)
+          .await;
         let secs = SystemTime::now()
           .duration_since(UNIX_EPOCH)
           .map(|d| d.as_secs())

@@ -156,6 +156,12 @@ impl PersistedState {
     Self::new(DaemonState::default(), None)
   }
 
+  /// The directory `state.json` lives in, or `None` in ephemeral (test) mode.
+  /// Backends hang their own durable per-model caches off it.
+  pub fn state_dir(&self) -> Option<&std::path::Path> {
+    self.state_dir.as_deref()
+  }
+
   /// Snapshot — cheap clone of the inner state.
   pub async fn snapshot(&self) -> DaemonState {
     self.state.lock().await.clone()

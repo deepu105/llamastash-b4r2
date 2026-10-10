@@ -66,6 +66,11 @@ struct Args {
   #[cfg_attr(not(unix), allow(dead_code))]
   sigterm_exit_delay_ms: Option<u64>,
   print_env: Vec<String>,
+  /// `--slot-save-path PATH` — where `action=save` writes its marker file.
+  /// Also advertised in `--help`, so the daemon's slot-capability probe
+  /// passes and the prompt-cache save/restore hooks exercise their real
+  /// HTTP path against this fixture.
+  slot_save_path: Option<std::path::PathBuf>,
   /// Set when launched with `--spec-type draft-mtp` (MTP speculative decoding).
   /// Makes the fixture print a `draft acceptance = …` slot-timing line to
   /// stderr at startup so the daemon's log ring buffer carries it, exactly like
@@ -130,6 +135,7 @@ fn parse_args() -> Args {
   let mut sigterm_exit_delay_ms = None;
   let mut print_env = Vec::new();
   let mut spec_mtp = false;
+  let mut slot_save_path = None;
   while let Some(arg) = args.next() {
     match arg.as_str() {
       "--host" => host = args.next().expect("--host needs value"),
@@ -150,6 +156,7 @@ fn parse_args() -> Args {
         sigterm_exit_delay_ms = args.next().and_then(|v| v.parse().ok());
       }
       "--print-env" => print_env.extend(args.next()),
+      "--slot-save-path" => slot_save_path = args.next().map(std::path::PathBuf::from),
       // Silently ignore unknown flags so the supervisor can pass
       // through reasoning bundles + advanced overrides without
       // teaching the fixture every llama-server flag.
@@ -168,6 +175,7 @@ fn parse_args() -> Args {
     sigterm_exit_delay_ms,
     print_env,
     spec_mtp,
+    slot_save_path,
   }
 }
 
@@ -200,6 +208,9 @@ async fn main() {
     } else {
       println!("-lm,   --load-mode MODE                 model loading mode (default: auto)");
     }
+    println!(
+      "      --slot-save-path PATH              path to save slot kv cache (default: disabled)"
+    );
     return;
   }
 
@@ -331,6 +342,79 @@ async fn handle(
   }
 
   match (method.as_str(), path.as_str()) {
+    // ── slot prompt-cache surface (prompt-cache persistence tests) ──
+    // One idle slot holding a prompt; `action=save|restore` records a
+    // marker file in `--slot-save-path` so a test can prove the daemon
+    // saved before the stop and restored before Ready.
+    ("GET", "/slots") => {
+      write_response(
+        &mut wr,
+        200,
+        "application/json",
+        b"[{\"id\":0,\"n_ctx\":4096,\"is_processing\":false,\"n_prompt_tokens\":42}]",
+      )
+      .await?;
+    }
+    ("POST", p) if p.starts_with("/slots/") => {
+      // /slots/<id>?action=save|restore ; body {"filename":"slot-0.bin"}.
+      let id = p["/slots/".len()..]
+        .split(['?', '/'])
+        .next()
+        .unwrap_or("0")
+        .to_string();
+      let action = p
+        .split("action=")
+        .nth(1)
+        .map(|s| s.split('&').next().unwrap_or(s).to_string())
+        .unwrap_or_default();
+      let filename: String = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+          v.get("filename")
+            .and_then(|f| f.as_str())
+            .map(str::to_string)
+        })
+        .unwrap_or_default();
+      let marker_ok = args.slot_save_path.as_ref().is_some_and(|dir| {
+        let _ = std::fs::create_dir_all(dir);
+        // The marker proves which action the daemon asked for; the raw
+        // `filename` mirrors what a real llama-server leaves on disk, so
+        // prune/cap logic sees a realistic directory.
+        std::fs::write(dir.join(&filename), format!("kv {id}"))
+          .and_then(|()| {
+            std::fs::write(
+              dir.join(format!("{action}-{filename}")),
+              format!("slot {id}"),
+            )
+          })
+          .is_ok()
+      });
+      if !marker_ok {
+        write_response(
+          &mut wr,
+          400,
+          "application/json",
+          b"{\"error\":{\"msg\":\"no slot-save-path configured\"}}",
+        )
+        .await?;
+      } else if action == "restore" {
+        write_response(
+          &mut wr,
+          200,
+          "application/json",
+          b"{\"id_slot\":0,\"n_restored\":42,\"n_read\":8,\"timings\":{\"restore_ms\":1}}",
+        )
+        .await?;
+      } else {
+        write_response(
+          &mut wr,
+          200,
+          "application/json",
+          b"{\"id_slot\":0,\"n_saved\":42,\"n_written\":8,\"timings\":{\"save_ms\":1}}",
+        )
+        .await?;
+      }
+    }
     // Stock llama-server serves its web UI at `/`; mirror that with a
     // tiny recognisable page so the proxy's `/ui/` forwarding tests can
     // assert the body came from the backend (and not from a llamastash

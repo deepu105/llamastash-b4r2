@@ -226,6 +226,11 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
 async fn stop_launch(ctx: &crate::daemon::context::MethodContext, launch_id: &LaunchId) {
   use crate::backend::Backend;
   let backend = crate::daemon::launch_service::backend_for_launch(ctx, launch_id).await;
+  // Eviction is the one stop path that lets a backend persist what the
+  // process was holding (a llama.cpp prompt cache, say) before the SIGTERM.
+  if let Some(model) = ctx.supervisors.get(launch_id).await {
+    backend.before_evict_stop(&model).await;
+  }
   let _ = backend
     .stop(ctx, launch_id, EVICT_STOP_GRACE.as_secs())
     .await;

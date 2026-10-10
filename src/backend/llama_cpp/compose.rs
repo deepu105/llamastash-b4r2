@@ -71,6 +71,22 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
     argv.push("--jinja".into());
   }
   argv.extend(load_mode_argv(params));
+  // Prompt-cache persistence: point the server at this model's slot save
+  // directory. Both facts ride on `launch_config` — the config decision
+  // (`slot_cache_dir`, seeded by `seed_launch_knobs`) and the per-binary veto
+  // (`slot_save_path`, seeded by `seed_binary_caps` from the `--help` probe).
+  // Missing either means no flag: an old build must not see an unknown
+  // argument, and an absent slot before this key existed launches unchanged.
+  if params
+    .launch_config
+    .get(super::LLAMACPP_KNOB_SLOT_SAVE)
+    .is_some_and(|s| s == "true")
+  {
+    if let Some(dir) = params.launch_config.get(super::LLAMACPP_KNOB_SLOT_DIR) {
+      argv.push("--slot-save-path".into());
+      argv.push(dir.clone().into());
+    }
+  }
   if params.reasoning {
     argv.push("--reasoning-format".into());
     argv.push("deepseek".into());
@@ -195,6 +211,40 @@ mod tests {
 
   fn base_params() -> LaunchParams {
     LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat)
+  }
+
+  /// `--slot-save-path` rides on two `launch_config` facts; both must hold.
+  fn with_slot_cache(save: Option<&str>, dir: Option<&str>) -> Vec<String> {
+    let mut p = base_params();
+    for (k, v) in [
+      (super::super::LLAMACPP_KNOB_SLOT_SAVE, save),
+      (super::super::LLAMACPP_KNOB_SLOT_DIR, dir),
+    ] {
+      if let Some(v) = v {
+        p.launch_config.insert(k.to_string(), v.to_string());
+      }
+    }
+    strs(&compose(&p, 11500))
+  }
+
+  #[test]
+  fn slot_save_path_is_emitted_when_the_build_and_the_config_allow_it() {
+    let argv = with_slot_cache(Some("true"), Some("/state/slot-cache/abcd"));
+    let i = argv.iter().position(|a| a == "--slot-save-path").unwrap();
+    assert_eq!(argv[i + 1], "/state/slot-cache/abcd");
+  }
+
+  #[test]
+  fn slot_save_path_is_absent_when_the_build_lacks_it_or_the_dir_is_unset() {
+    // Binary veto (`slot_save_path: false` from the caps probe).
+    for argv in [
+      with_slot_cache(Some("false"), Some("/state/slot-cache/abcd")),
+      with_slot_cache(None, Some("/state/slot-cache/abcd")),
+      with_slot_cache(Some("true"), None),
+      with_slot_cache(None, None),
+    ] {
+      assert!(!argv.iter().any(|a| a == "--slot-save-path"), "{argv:?}");
+    }
   }
 
   fn with_load_mode(mode: &str, dialect: &str) -> Vec<String> {

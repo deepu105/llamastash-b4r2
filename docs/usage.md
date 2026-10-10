@@ -82,6 +82,9 @@ backend: # Per-engine config, one block per backend. llama.cpp is the
     strict_fit: false # Refuse (vs degrade) an unplaceable --fit. Env: LLAMASTASH_STRICT_FIT.
     jinja: true # Emit --jinja every launch (tool calling). Config-only.
     map_anthropic_effort: true # Map Anthropic output_config.effort to the engine kwarg. Config-only.
+    slot_cache: true # Keep prompt caches across an eviction (llama.cpp). Config-only.
+    slot_cache_max_mb: 4096 # Per-model cap on slot save files. Config-only.
+    slot_cache_ttl_days: 14 # Slot save files older than this are dropped. Config-only.
   lemonade:
     # servers: [{ binary: /opt/lemonade/lemond }] # lemond path; else PATH.
     # enabled: # tri-state: unset=auto, true=force on, false=force off.
@@ -617,6 +620,15 @@ Beside its launch settings an entry can pin how long it stays loaded and whether
 - `preload: true` — start this preset when the daemon boots. Same as naming it in `daemon.preload`, and the same exemption applies: a preloaded launch is manual intent, so it stays up until you stop it. The preset's key has to name **one** model: a preloaded launch can never be unloaded, so an arch or wide-glob key (which would pin every model it matches) is skipped at boot with a line in the daemon log — name the model, or list them under `daemon.preload` in the order you want them.
 
 A re-save that says nothing about residency keeps whatever the name already pins, even when the save lands under the model's own key and shadows an arch or glob entry of the same name; `--no-idle-ttl` / `--no-preload` are the only way to drop a pin. The one exception is `preload`: a family key's `preload: true` is not carried onto a single-model key, because boot refuses to preload a family and a preloaded launch can never be unloaded — so a `Ctrl+P` recapture cannot start loading your model at boot behind your back. The sweep reads the TTL from the daemon's live preset store on every pass, so `presets save --idle-ttl` moves a running launch's deadline without a relaunch; a hand edit to `config.yaml` needs `daemon restart`, like any other hand edit. When a request cannot be admitted because the host is full, the daemon first tries to make room by unloading idle auto-started launches, least-recently-used first (see §Proxy); launches pinned to `idle_ttl_secs: 0`, launches with a request in flight, and manual or preloaded launches are never picked.
+
+#### Prompt cache across an eviction
+
+An evicted launch loses its process, and with it the engine's in-process prompt cache: the next request to the same conversation would reprocess the whole history. For llama.cpp launches the daemon keeps that cache on disk instead (`backend.llamacpp.slot_cache: true`, the default):
+
+- **When it saves.** Only the eviction paths — the idle sweep and make-room — save: just before the stop, every idle slot that holds a prompt is written out through `llama-server`'s `--slot-save-path` + `POST /slots/{id}?action=save`. A manual `llamastash stop`, a restart, or daemon shutdown never saves; a deliberate stop stays instant. The save is best-effort with a bounded timeout, so a slow disk delays an eviction by at most that budget and otherwise changes nothing.
+- **Where the files live.** `<state dir>/slot-cache/<model-hash>/slot-<slot>.bin` — one file per slot, keyed by model path, mode `0600`-class like `state.json` (the file holds your conversation's KV state). When the model launches again, the files are restored into their slots after the health probe passes and **before** the launch takes traffic, so the first returning request already hits the cache. llama.cpp's own slot selection (longest common prefix against each slot's cached prompt) matches the returning conversation to its restored slot; a conversation that no longer matches simply reprocesses like before.
+- **How it is capped and cleaned up.** A save file is roughly 32 KB per cached token, so a 100k-token slot is about 3.3 GB. Per model, the directory is capped at `slot_cache_max_mb` (default 4096): over the cap, the oldest files go first. Files older than `slot_cache_ttl_days` (default 14) are dropped on the next save or restore pass. Restore failures (context shrank, the model file changed, a corrupt file) are cache misses, never failed launches.
+- **Old builds.** The flag is only passed to a `llama-server` whose `--help` advertises `--slot-save-path`; older fork builds launch exactly as before. Set `slot_cache: false` to turn the feature off everywhere.
 
 ### `llamastash favorites`
 
