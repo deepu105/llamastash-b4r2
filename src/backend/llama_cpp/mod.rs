@@ -17,6 +17,7 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+mod slots;
 mod telemetry;
 
 use compose::compose;
@@ -47,6 +48,11 @@ pub const LLAMACPP_KNOB_FIT_CTX_FLOOR: &str = "fit_ctx_floor";
 /// `launch_config` key carrying which spelling the resolved build takes for the
 /// model-loading mode. Written by `seed_binary_caps`, read by `compose`.
 pub const LLAMACPP_KNOB_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
+/// `launch_config` key carrying the `--slot-save-path` directory this launch
+/// was given for its prompt (KV) cache. Absent when the cache is disabled or
+/// the directory could not be created — which is also the record that this
+/// server has no `/slots` save surface.
+pub const LLAMACPP_KNOB_SLOT_SAVE_DIR: &str = "slot_save_dir";
 /// The same fact as a [`caps`] probe key on `Server::caps`.
 pub const CAP_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
 
@@ -160,6 +166,17 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Byte cap on the prompt (KV) cache slot dumps written when the proxy
+  /// evicts a launch. Oldest files are dropped first past the cap.
+  /// `0` disables the prompt cache entirely (no `--slot-save-path`, no
+  /// save, no restore).
+  #[serde(default = "default_slot_cache_max_bytes")]
+  pub slot_cache_max_bytes: u64,
+  /// How long a slot dump may sit unrestored before it expires; a dump
+  /// older than this is dropped at the next prune. `0` means no age
+  /// limit — the size cap alone bounds the pile.
+  #[serde(default = "default_slot_cache_max_age_days")]
+  pub slot_cache_max_age_days: u32,
 }
 
 fn default_true() -> bool {
@@ -170,6 +187,17 @@ fn default_fit_ctx_floor() -> u32 {
   crate::config::DEFAULT_FIT_CTX_FLOOR
 }
 
+/// 16 GiB — roughly five 100k-token slot dumps at a default KV cache,
+/// enough for the usual one-or-two-conversations-per-model case without
+/// letting the pile roam.
+fn default_slot_cache_max_bytes() -> u64 {
+  16 * 1024 * 1024 * 1024
+}
+
+fn default_slot_cache_max_age_days() -> u32 {
+  3
+}
+
 impl Default for LlamaCppConfig {
   fn default() -> Self {
     Self {
@@ -178,6 +206,8 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      slot_cache_max_bytes: default_slot_cache_max_bytes(),
+      slot_cache_max_age_days: default_slot_cache_max_age_days(),
     }
   }
 }
@@ -463,6 +493,51 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+    // Prompt (KV) cache dir for `--slot-save-path`. Same bench-parity
+    // suppression as `--jinja`: the hatch keeps argv byte-identical to raw
+    // `llama-server`. When the cache is off or the dir cannot be created the
+    // key stays absent, `compose` emits no flag, and the save/restore paths
+    // no-op on the missing key.
+    params.launch_config.remove(LLAMACPP_KNOB_SLOT_SAVE_DIR);
+    if cfg.slot_cache_max_bytes > 0 && !crate::launch::params::bench_disable_defaults_from_env() {
+      if let Some(dir) = slots::ensure_cache_dir() {
+        params.launch_config.insert(
+          LLAMACPP_KNOB_SLOT_SAVE_DIR.to_string(),
+          dir.display().to_string(),
+        );
+      }
+    }
+  }
+
+  fn supervise_at_boot(
+    &self,
+    _ctx: &MethodContext,
+    _log_dir: &Path,
+    _probe_timeout: Option<std::time::Duration>,
+  ) {
+    // llama.cpp supervises no infra process, but boot is the one moment every
+    // backend gets to run a cheap once-per-daemon pass: expire slot dumps left
+    // by an earlier session so an idle daemon does not sit on GBs of stale cache
+    // until the first eviction.
+    let cfg = &_ctx.backend.llamacpp;
+    slots::prune_at_boot(cfg.slot_cache_max_bytes, cfg.slot_cache_max_age_days);
+  }
+
+  async fn before_evict_stop(
+    &self,
+    ctx: &MethodContext,
+    launch_id: &crate::daemon::registry::LaunchId,
+  ) {
+    slots::evict_save(ctx, launch_id).await;
+  }
+
+  async fn on_ready(
+    &self,
+    port: u16,
+    params: &LaunchParams,
+    actuals: &crate::daemon::actuals::Actuals,
+  ) {
+    slots::restore_on_ready(port, params, actuals).await;
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {

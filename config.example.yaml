@@ -545,6 +545,26 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     map_anthropic_effort: true
 
+    # Prompt (KV) cache saved across evictions. When the idle sweep or
+    # make-room stops a llama.cpp launch, its slots' prompt caches are
+    # written to `<cache dir>/slot-cache/` first, and the next launch of the
+    # same model at the same layout reads them back before serving — the
+    # returning conversation hits the prompt cache instead of reprocessing
+    # the prompt (save + restore costs seconds against minutes-to-hours of
+    # reprocess; see docs/spikes/2026-10-10-slot-kv-cache-persistence.md).
+    # This byte cap bounds the pile (oldest dumps go first past the cap);
+    # `0` disables the feature entirely — no dumps written, nothing restored.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    slot_cache_max_bytes: 17179869184 # 16 GiB ≈ five 100k-token dumps.
+
+    # How long a dump may sit unrestored before it expires (the sweep runs at
+    # daemon boot and around every save). `0` means no age limit — the byte
+    # cap alone bounds the pile.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    slot_cache_max_age_days: 3
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend

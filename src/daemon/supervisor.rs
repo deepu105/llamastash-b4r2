@@ -674,6 +674,13 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
             );
           }
         }
+        // Let the backend restore per-launch state it persisted on an earlier
+        // instance (llama.cpp reads back saved slot KV caches) before Ready
+        // flips: surfaces queued on Ready forward on the transition, so the
+        // restore has to finish inside it. Default no-op for other backends.
+        probe_backend
+          .on_ready(probe_model.inner.port, probe_model.params(), &actuals)
+          .await;
         *probe_model.inner.actuals.write().await = actuals;
         let secs = SystemTime::now()
           .duration_since(UNIX_EPOCH)

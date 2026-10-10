@@ -987,6 +987,32 @@ pub trait Backend {
       .await
   }
 
+  /// The proxy's eviction machinery (idle sweep, make-room) is about to stop
+  /// this launch. A backend that can persist recoverable engine state does so
+  /// here, while the engine still answers HTTP. Best-effort: the eviction stop
+  /// runs whatever this does, and eviction latency rides on it — bound the
+  /// work inside. Default: no-op.
+  async fn before_evict_stop(
+    &self,
+    _ctx: &MethodContext,
+    _launch_id: &crate::daemon::registry::LaunchId,
+  ) {
+  }
+
+  /// The engine is up and its actuals were just read, but Ready is not
+  /// published yet: surfaces that wait on Ready (the proxy's auto-start queue)
+  /// forward the moment the state flips. A backend with per-launch state
+  /// persisted on disk restores it here so the first forwarded request already
+  /// benefits. Runs on every launch that reaches Ready, so the miss path must
+  /// be near-free. Default: no-op.
+  async fn on_ready(
+    &self,
+    _port: u16,
+    _params: &LaunchParams,
+    _actuals: &crate::daemon::actuals::Actuals,
+  ) {
+  }
+
   /// Stop a launch this backend owns, returning the `{launch_id, state}` response
   /// (or a JSON-RPC error). **The backend owns the lifecycle**, mirroring
   /// [`start`](Backend::start): the default SIGTERMs the supervised child
@@ -1171,6 +1197,23 @@ impl Backend for Backends {
     timeout: std::time::Duration,
   ) -> crate::daemon::actuals::Actuals {
     for_each_backend!(self, b => b.fetch_actuals(port, timeout).await)
+  }
+
+  async fn before_evict_stop(
+    &self,
+    ctx: &MethodContext,
+    launch_id: &crate::daemon::registry::LaunchId,
+  ) {
+    for_each_backend!(self, b => b.before_evict_stop(ctx, launch_id).await)
+  }
+
+  async fn on_ready(
+    &self,
+    port: u16,
+    params: &LaunchParams,
+    actuals: &crate::daemon::actuals::Actuals,
+  ) {
+    for_each_backend!(self, b => b.on_ready(port, params, actuals).await)
   }
 
   fn speculation_set_in_extras(&self, extras: &[OsString]) -> bool {
