@@ -52,6 +52,16 @@ daemon's state directory:
   (always `127.0.0.1`) but can't check what a foreign binary binds, so
   binding loopback is the entry author's job.
 - The daemon does **not** persist or transmit telemetry.
+- **Prompt cache files.** With `backend.llamacpp.prompt_cache` on (the
+  default), the slots of a llama.cpp launch the proxy unloads are written
+  to `<cache dir>/slot-cache/` (directory mode `0700`). The files hold
+  prompt contents as tokens. They are deleted when restored, when older
+  than `max_age_hours`, and oldest-first past `max_gb`. The
+  `--slot-save-path` flag behind this also turns on llama-server's
+  `POST /slots/<id>?action=save|restore|erase` routes on the child's
+  loopback port, and the proxy's `/ui/` path forwards to them like any
+  other child route. llama-server rejects a filename that would leave the
+  slot directory.
 
 Issues we treat as in scope:
 

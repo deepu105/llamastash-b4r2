@@ -180,8 +180,22 @@ Suite C shows no difference between the builds: both sit inside its noise (TTFT 
 
 ### Items
 
-- [ ] **Keep a model's prompt cache across an unload.** When make-room or the idle sweep stops a llama.cpp launch mid-conversation, the next request reprocesses the whole prompt. llama-server can write a slot's KV cache to disk and read it back: `--slot-save-path PATH` plus `POST /slots/{id_slot}?action=save|restore` (present on local build 11390 and in upstream `tools/server/README.md`, checked 2026-10-05). Nothing in `src/` uses it. Spike first: measure save time, restore time and file size at a large context (100k tokens) against plain reprocessing. Then decide when to save (before an eviction only), where the files live, how they are capped and cleaned up, and how a restored slot is matched to the returning conversation.
+- [x] **Keep a model's prompt cache across an unload.** When make-room or the idle sweep stops a llama.cpp launch mid-conversation, the next request reprocesses the whole prompt. llama-server can write a slot's KV cache to disk and read it back: `--slot-save-path PATH` plus `POST /slots/{id_slot}?action=save|restore` (present on local build 11390 and in upstream `tools/server/README.md`, checked 2026-10-05). Nothing in `src/` uses it. Spike first: measure save time, restore time and file size at a large context (100k tokens) against plain reprocessing. Then decide when to save (before an eviction only), where the files live, how they are capped and cleaned up, and how a restored slot is matched to the returning conversation.
 - [ ] **Warm the page cache before a load (`llamastash warm <model>`).** Weight reads dominate reload time: `docs/usage.md:855` measured 93-105 s cold against about 6 s with the weights already in page cache, and the loading keepalive entry in `TODO.md` has a cold 104 GB GGUF at roughly 130 s. Ask the kernel to read a model's shards and mmproj ahead of the launch: `posix_fadvise(POSIX_FADV_WILLNEED)` on Linux (and FreeBSD), `PrefetchVirtualMemory` on Windows, and a bounded buffered read thread on macOS, which has no `posix_fadvise`. Nothing in `src/` calls `posix_fadvise` or `readahead` today. Page cache is reclaimable, so warmed bytes need no admission reservation; the guard is to refuse rather than warm past the free pool, and to skip while a launch is loading, or the read evicts what a running launch holds resident. Sits beside the KV item above rather than duplicating it: that keeps the prompt cache, this covers re-reading weights, and a `--slot-save-path` file wants the same warming on restore. Surfaces: `llamastash warm <model> --json`, and `daemon.preload_warm:` as the RAM-only sibling of `daemon.preload` (no server spawned).
+
+### Result: prompt cache (2026-10-10)
+
+Go. Spike on CPU at 100,000 tokens (Llama-3.2-1B Q4_K_M, 8 threads, llama.cpp build 11525): reprocess 2,910 s (48.5 minutes), save 0.72 s, restore 0.57 s (1.26 s with the file read from disk), file 3.05 GiB. Numbers and method: [`docs/spikes/2026-10-10-slot-save-restore.md`](../spikes/2026-10-10-slot-save-restore.md).
+
+Decisions:
+
+- **When to save.** Before a proxy eviction only: the idle sweep and make-room, in `eviction::stop_launch`. `stop`, `stop --all` and shutdown save nothing. A request that arrives during the save calls the unload off.
+- **Where the files live.** `<cache dir>/slot-cache/<key>-slot<id>.bin`, directory mode `0700`. One flat directory, because llama-server takes a bare filename. `<key>` hashes the launch argv and the size and mtime of the model and projector files, so a file is only ever offered to the launch configuration that wrote it.
+- **Cap and cleanup.** A restored file is deleted, so files exist only while a model is unloaded. `max_gb` (32) caps the directory: a slot whose KV estimate is over the cap is not saved, and past the cap the oldest files go first. `max_age_hours` (24) deletes files nobody came back for. A save needs 2 GiB free beyond its size. Cleanup runs on every save and every llama.cpp start.
+- **Slot matching.** None in llamastash. Files go back into the slot id they came from before the launch is `Ready`, and llama-server picks the slot with the longest common token prefix for each request.
+- **Hooks.** `Backend::before_evict` and `Backend::after_ready`, both no-ops by default, so `eviction.rs` and the supervisor name no engine route. The plan said "before stop"; the hook is eviction-only because a manual stop must not save.
+
+Not done here: the real-hardware check on a GPU build with a large model (plan step 5). The spike and the end-to-end run were CPU-only by instruction. Follow-ups are in `TODO.md` under Batch 4.
 
 ## Batch 5: CLI setup commands
 

@@ -3,8 +3,8 @@
 Two families live here. `end_to_end/`, `overhead/` and `proxy/` are the Python
 harnesses behind the published numbers in `docs/benchmarks/` — see
 `docs/benchmarks/methodology.md` before touching those. The shell scripts below
-are speculative-decoding comparisons, kept because they are worth re-running
-whenever a backend or a draft head changes.
+are one-off comparisons (slot save / restore, speculative decoding), kept
+because they are worth re-running whenever a backend or a draft head changes.
 
 ## Before running any of them
 
@@ -22,6 +22,43 @@ rocm-smi --showpower                        # ~80 W under load, ~20 W throttled
 Every script here records the power state next to every result for exactly this
 reason. Stop stray daemons (`llamastash daemon stop`, `pkill -x ds4-server`)
 before a run so nothing competes for the GPU or the power budget.
+
+## `slot_save_restore.py`: slot save / restore against reprocessing
+
+```sh
+scripts/bench/slot_save_restore.py --server /path/to/llama-server \
+    --model /path/to/model.gguf --work-dir /path/on/a/real/disk \
+    --tokens 100000 --threads 8
+```
+
+Drives one raw `llama-server` (no llamastash): processes an N-token prompt,
+saves the slot, then restarts and restores it twice (save file in page cache,
+then evicted from it) and once more with no restore. Writes `results.json` and
+the server logs into `--work-dir`. Stdlib only. The numbers behind
+`docs/spikes/2026-10-10-slot-save-restore.md`.
+
+Keep `--work-dir` off tmpfs: the save file is about the size of the KV cache
+(3 GiB at 100k tokens on a 1B model). `--server-arg` passes extra flags through,
+for example `--server-arg=-ngl --server-arg=99` on a GPU build.
+
+## `prompt_cache_e2e.py`: the prompt cache through an isolated daemon
+
+```sh
+scripts/bench/prompt_cache_e2e.py --llamastash target/debug/llamastash \
+    --llama-server /path/to/llama-server --model /path/to/model.gguf \
+    --work-dir /path/on/a/real/disk [--disable]
+```
+
+Starts a daemon with its own state, config and cache dirs under `--work-dir`
+and its own proxy port, sends a long prompt and a follow-up, waits for the idle
+sweep to unload the model, then sends the next follow-up. Reports cached and
+processed prompt tokens and prompt time per request, the slot files on disk
+while the model was unloaded, and the daemon's `prompt cache:` log lines.
+`--disable` runs the same steps with `prompt_cache.enabled: false`, which is
+the comparison. Stops its daemon when done. Stdlib only.
+
+The control plane has no port option: it takes the first free port from 48134
+up, so a daemon already on this host keeps its own.
 
 ## `mtp_ab.sh` — MTP on/off for one model
 

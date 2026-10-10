@@ -545,6 +545,31 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     map_anthropic_effort: true
 
+    # Keep a model's prompt cache across an unload (default: on). When the
+    # proxy unloads an idle launch, or unloads one to make room for another
+    # model, each llama-server slot that holds a prompt is first saved to
+    # `<cache dir>/slot-cache/`. The next start of the same model with the
+    # same launch settings reads the files back before it takes a request,
+    # then deletes them, so the returning conversation does not reprocess
+    # its prompt. `llamastash stop` and a daemon shutdown save nothing.
+    #
+    # A file is about the size of the KV cache it holds: 3.05 GiB for 100k
+    # tokens on a 1B model, and roughly four times that on an 8B one.
+    # Needs a llama-server build that has `--slot-save-path`; on a build
+    # without it the launch runs as before.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    prompt_cache:
+      enabled: true
+      # Size cap for the whole directory, in GiB. A slot estimated above it
+      # is not saved; past it the oldest files are deleted first.
+      max_gb: 32
+      # A saved file older than this is deleted without being restored.
+      # 0 = no age limit.
+      max_age_hours: 24
+      # A slot holding fewer prompt tokens than this is not saved.
+      min_tokens: 1024
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend
