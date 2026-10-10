@@ -65,6 +65,8 @@ pub struct ProxyState {
   /// llama-server child that will fail the same way. Cleared on a
   /// successful launch.
   pub(crate) failures: Arc<FailureTracker>,
+  /// The launches the idle sweep or make-room is unloading right now.
+  pub(crate) evictions: super::eviction::Evictions,
   /// Full IPC context handle. Cheap to clone (every field is
   /// already `Arc`-wrapped); the proxy reads catalog / supervisors /
   /// persisted state / launch env through it so there is no
@@ -160,6 +162,7 @@ impl ProxyState {
       coalesce: Coalesce::new(),
       mru: MruTracker::new(),
       failures: Arc::new(FailureTracker::new()),
+      evictions: Default::default(),
       ctx: ctx.clone(),
       ollama_compat,
       fallback_enabled,

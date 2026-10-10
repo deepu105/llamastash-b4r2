@@ -68,6 +68,9 @@ pub struct DaemonOptions {
   /// under here so the supervisor's stdout/stderr tee + the
   /// `logs_tail` IPC method have a durable backing store.
   pub log_dir: PathBuf,
+  /// The cache directory `log_dir` sits in. Backends keep reproducible
+  /// per-launch files under it (a saved prompt cache, say).
+  pub cache_dir: PathBuf,
   /// `llama-server` binary path. `None` defers resolution to
   /// `start_model` time (current behaviour for tests that never
   /// launch); production startup pre-resolves so the daemon fails
@@ -168,6 +171,7 @@ impl DaemonOptions {
   pub fn rooted_at(root: PathBuf) -> Self {
     let log_dir = root.join("logs");
     Self {
+      cache_dir: root.clone(),
       state_dir: root,
       log_dir,
       binary: None,
@@ -214,11 +218,13 @@ impl DaemonOptions {
   pub fn from_defaults() -> Result<Self> {
     let state_dir = crate::util::paths::state_dir()
       .context("could not resolve a state directory for this platform")?;
-    let log_dir = crate::util::paths::log_dir()
+    let cache_dir = crate::util::paths::cache_dir()
       .context("could not resolve a cache/log directory for this platform")?;
+    let log_dir = cache_dir.join("logs");
     Ok(Self {
       state_dir,
       log_dir,
+      cache_dir,
       binary: None,
       port_range: PortRange::default(),
       // Production-default discovery: no scan roots until a later
@@ -429,6 +435,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     .with_external(external_combined)
     .with_proxy_status(std::sync::Arc::clone(&proxy_status_cell))
     .with_preload(opts.preload.clone())
+    .with_cache_dir(opts.cache_dir.clone())
     .with_backend(opts.backend.clone(), opts.backend_force.clone());
   if opts.binary.is_none() {
     log::info!(
@@ -489,6 +496,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
   let boot_probe_timeout = opts.probe_timeout_secs.map(std::time::Duration::from_secs);
   for backend in crate::backend::Backends::all() {
     crate::backend::Backend::supervise_at_boot(&backend, &ctx, &opts.log_dir, boot_probe_timeout);
+    crate::backend::Backend::boot_housekeeping(&backend, &ctx);
   }
 
   // 8a-ii. Idle auto-shutdown (opt-in via `daemon.idle_timeout_secs`).

@@ -289,6 +289,47 @@ async fn ui_post_body_over_cap_returns_413() {
   std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `/ui/<anything>` reaches the upstream, and a launch that keeps its prompt
+/// cache across an eviction has the slot save/restore/erase actions switched
+/// on. Those are the daemon's to call: through `/ui` they would let any proxy
+/// client write files and swap a running model's cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ui_refuses_slot_actions_but_forwards_the_slots_read() {
+  let dir = unique_temp("uislots");
+  let registry = SupervisorRegistry::new();
+  let model = spawn_fake("/fixture/solo.gguf", &dir).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+  let state = build_state(
+    vec![discovered("/fixture/solo.gguf", Some("solo"))],
+    registry,
+    None,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  for action in ["save", "restore", "erase"] {
+    let (status, _headers, response) = http_post(
+      addr,
+      &format!("/ui/slots/0?action={action}"),
+      r#"{"filename":"x.bin"}"#,
+      &[],
+    )
+    .await;
+    assert_eq!(status, 403, "{action}");
+    let v: Value = serde_json::from_slice(&response).expect("json body");
+    assert_eq!(v["error"]["type"], "forbidden");
+  }
+
+  let (status, _h, body) = http_get(addr, "/ui/slots", &[]).await;
+  assert_eq!(status, 200, "the web UI reads slot state");
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  assert_eq!(v[0]["id"], 0);
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_running_shows_chooser_then_cookie_pins() {
   let dir = unique_temp("chooser");

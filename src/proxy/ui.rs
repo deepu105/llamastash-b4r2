@@ -218,6 +218,13 @@ async fn forward_ui(
   entry: RunningEntry,
 ) -> ProxyResponse {
   let (method, uri, headers, body) = forward::deconstruct(req);
+  if is_slot_action(&method, &strip_ui_prefix(&uri)) {
+    return super::router::error_response(
+      StatusCode::FORBIDDEN,
+      "forbidden",
+      "slot actions are not served through /ui",
+    );
+  }
   // Buffer the body under the daemon's cap via the same helper the
   // data plane uses. UI asset GETs are bodyless; the base-relative API
   // POSTs carry a JSON payload we pass through untouched.
@@ -251,6 +258,21 @@ async fn forward_ui(
     None,
   )
   .await
+}
+
+/// Whether a request is an upstream slot action: a write to `/slots/...`,
+/// which saves, loads or erases a slot's prompt cache. The daemon makes those
+/// calls itself on the upstream's loopback port. Passing them through `/ui`
+/// would let anything that reaches the proxy, on the LAN when it is exposed,
+/// write files and swap a running model's cache. The UI's own `GET /slots`
+/// is unaffected.
+fn is_slot_action(method: &hyper::Method, upstream_path_and_query: &str) -> bool {
+  let path = upstream_path_and_query
+    .split('?')
+    .next()
+    .unwrap_or_default();
+  !matches!(*method, hyper::Method::GET | hyper::Method::HEAD)
+    && (path == "/slots" || path.starts_with("/slots/"))
 }
 
 /// Strip the leading `/ui` from a `/ui/...` request URI, preserving the
@@ -526,6 +548,18 @@ mod tests {
       !green.is_empty() && !red.is_empty() && green != red,
       "{green} vs {red}"
     );
+  }
+
+  #[test]
+  fn only_writes_to_the_slot_endpoints_are_slot_actions() {
+    use hyper::Method;
+    assert!(is_slot_action(&Method::POST, "/slots/0?action=save"));
+    assert!(is_slot_action(&Method::POST, "/slots/3?action=erase"));
+    assert!(is_slot_action(&Method::PUT, "/slots"));
+    assert!(!is_slot_action(&Method::GET, "/slots"), "the UI reads it");
+    assert!(!is_slot_action(&Method::GET, "/slots/0?action=save"));
+    assert!(!is_slot_action(&Method::POST, "/v1/chat/completions"));
+    assert!(!is_slot_action(&Method::POST, "/slotsmith"));
   }
 
   #[test]

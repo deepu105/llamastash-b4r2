@@ -82,6 +82,11 @@ backend: # Per-engine config, one block per backend. llama.cpp is the
     strict_fit: false # Refuse (vs degrade) an unplaceable --fit. Env: LLAMASTASH_STRICT_FIT.
     jinja: true # Emit --jinja every launch (tool calling). Config-only.
     map_anthropic_effort: true # Map Anthropic output_config.effort to the engine kwarg. Config-only.
+    slot_save: # Keep a model's prompt cache across an unload. See §"Prompt cache across an unload".
+      enabled: true # Save slots before an eviction, restore them at the next start. Config-only.
+      # dir: /mnt/fast/slots # Default: slots/ in the cache directory.
+      max_gib: 32 # Cap on all saved files together. 0 = no cap.
+      max_age_hours: 24 # Older saves are deleted, not restored. 0 = no limit.
   lemonade:
     # servers: [{ binary: /opt/lemonade/lemond }] # lemond path; else PATH.
     # enabled: # tri-state: unset=auto, true=force on, false=force off.
@@ -1244,6 +1249,8 @@ Open `http://127.0.0.1:11435/ui/` in a browser (swap in the actual `proxy.listen
 
 `/ui` is reachable over [LAN](#lan-access-opt-in-behind-a-key) too. A browser can't send a bearer header by navigating, so when a key is configured the proxy answers `/ui` with `WWW-Authenticate: Basic`: the browser prompts once, you paste the proxy key as the **password** (any username), and it's remembered per-origin. Same key as the API path, no login page, no key-in-URL. On the keyless loopback default there's no prompt. As with the API, LAN mode is plaintext HTTP (no TLS yet), so the key crosses the wire as base64 — keep it on a trusted network.
 
+The upstream's slot actions are not served through `/ui`: a `POST` to `/ui/slots/...` answers `403`. They save, load and erase a model's prompt cache, and the daemon makes those calls itself (see [Prompt cache across an unload](#prompt-cache-across-an-unload)). `GET /ui/slots` still works.
+
 ### Ollama drop-in mode (opt-in)
 
 The official `ollama` CLI (and other Ollama-Go-based clients) issue a `HEAD /` handshake before any `/api/*` call and bail when the body isn't the literal `"Ollama is running"`. Default mode answers that probe with `"LlamaStash is running"` so the identity is honest; opt in to full Ollama impersonation when the goal is "this tool that natively speaks Ollama just works":
@@ -1386,6 +1393,34 @@ embed/rerank by **name pattern** (`excludeBy` on ids like `embed` / `rerank` /
 **Named launches are not discovered.** Neither generator sees them: `list --json` is a catalog listing, and the discovery plugin reads `/v1/models` once at startup, while a named id exists only while its launch runs. Until [the patchers learn to emit them](../TODO.md), add one by hand: duplicate the model's block and append `@<name>` to the key (and to its `name`), so `Qwen3.8-27B-Q4_K_M` gains a sibling `Qwen3.8-27B-Q4_K_M@coder`. The proxy auto-starts the named launch on first use, so the entry works even when nothing is running yet. The same applies to pi's `~/.pi/agent/models.json`.
 
 > **Auth posture.** On the default loopback bind the proxy has **no authentication** — the threat model is "same machine, any UID can issue requests," so don't run llamastash on a shared host. Exposing it on the LAN ([LAN access](#lan-access-opt-in-behind-a-key)) requires a bearer key, which llamastash auto-provisions and enforces; the daemon refuses a non-loopback bind with no key unless you pass `--insecure-no-auth`. TLS is still a deferred follow-up, so LAN mode is plaintext (trusted network or reverse proxy). The control plane and `llama-server` children always stay loopback regardless.
+
+### Prompt cache across an unload
+
+When the idle sweep or make-room stops a llama.cpp chat launch, the next request for that model reloads it and, without this, reprocesses the whole prompt. With `backend.llamacpp.slot_save.enabled: true` (the default) the daemon keeps the prompt cache instead:
+
+1. Before the eviction stops the launch, each slot that holds tokens is saved to disk with llama-server's own `POST /slots/{id}?action=save`.
+2. When a launch of the same model with the same settings next starts, the slots are restored before the launch is reported ready, so the request that triggered the reload already finds the cache.
+3. The restored files are deleted. The launch holds the cache in memory again and saves it again at its next eviction.
+
+Nothing identifies the conversation. llama-server picks the slot for each request by the longest common prefix with what each slot has cached, so the returning conversation lands on the restored slot and a different one does not.
+
+Measured on a 14k-token conversation after an idle-sweep unload (RTX 3050 Ti, `Llama-3.2-1B` Q4_K_M): 14,103 of 14,118 prompt tokens came from the restored cache and the prompt took 21 ms, against 0 cached tokens and 3,254 ms with `slot_save` off. At 100k tokens a save and a restore take about one second each, and reprocessing takes 50 s to 53 minutes depending on the machine. Numbers: [`docs/spikes/2026-10-10-slot-save-restore.md`](spikes/2026-10-10-slot-save-restore.md).
+
+What to know:
+
+- **Only an eviction saves.** `stop`, `daemon stop` and a crash save nothing.
+- **Files are large.** A slot file is the KV cache for its tokens: 3 GiB for 100k tokens on a 1B model, and several times that on a larger model. They go in `slots/` under the cache directory (`~/.cache/llamastash/slots` on Linux, or `backend.llamacpp.slot_save.dir`), one directory per model, readable by you only.
+- **Capped and cleaned up.** `max_gib` (default 32) caps all saved files together: the least recently saved are deleted first, and a save estimated to be larger than the cap, or than the free disk space minus 2 GiB, is not written. `max_age_hours` (default 24) deletes a save that was never picked up. A save is also deleted once it has been restored, or when llama-server refuses it.
+- **Same model, same settings.** A save is read back only by a launch of the same model file (path, size and modification time) with the same llama-server arguments. Change the context size, the cache type or the extras and the old save is not used; it ages out.
+- **Not saved:** embedding and rerank launches, a launch running speculative decoding (MTP or a draft model), a launch whose extras already pass `--slot-save-path`, and conversations llama-server has moved to its in-memory prompt cache (`--cache-ram`).
+- **Turning it off.** `slot_save.enabled: false` stops saving and restoring, and the next daemon start deletes the saved files.
+
+The daemon log has one line per save and per restore:
+
+```text
+slot save: Llama-3.2-1B-Instruct-Q4_K_M.gguf saved 14103 tokens in 1 slot(s), 0.4 GiB in 128 ms (estimated 0.4 GiB)
+slot save: Llama-3.2-1B-Instruct-Q4_K_M.gguf restored 14103 tokens in 1 slot(s), 0.4 GiB in 85 ms
+```
 
 ### Is the proxy up?
 

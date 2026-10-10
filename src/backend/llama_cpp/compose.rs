@@ -110,6 +110,12 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
     argv.push("--fit-ctx".into());
     argv.push(floor.to_string().into());
   }
+  // Only for a launch that keeps its prompt cache across an eviction (see
+  // `slot_save`); the flag is what turns the slot save/restore calls on.
+  if let Some(dir) = super::slot_save::dir_for(params) {
+    argv.push("--slot-save-path".into());
+    argv.push(dir.into());
+  }
   // Emit the device selector verbatim — exactly once. Empty / unset
   // means "let llama-server auto-select" (no flag).
   if let Some(sel) = params

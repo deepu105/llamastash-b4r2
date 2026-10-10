@@ -37,6 +37,13 @@
 //!   probe (`list_devices::probe`) runs exactly `<binary>
 //!   --list-devices`, so this is all it needs.
 //!
+//! - `--slot-save-path DIR` turns on llama-server's slot endpoints for the
+//!   fixture's one slot: `GET /slots`, and `POST /slots/0?action=save|restore`
+//!   with a `{"filename": ...}` body, which write and read a file in `DIR`.
+//!   A chat completion gives the slot tokens. `--fake-slot-save-delay-ms N`
+//!   makes a save take that long, and `GET /fake/slot` (fixture-only) reports
+//!   the slot's token count, how many saves ran and whether one is running.
+//!
 //! Output: when serving, this binary prints its bound address to
 //! stdout as the first line `listening on 127.0.0.1:<port>` so tests
 //! can wait for that signal if they want.
@@ -72,6 +79,22 @@ struct Args {
   /// a real llama-server after generation — the fixture the status
   /// draft-acceptance scan asserts against.
   spec_mtp: bool,
+  /// `--slot-save-path DIR`. Without it the slot actions answer 501, as on
+  /// real llama-server.
+  slot_save_path: Option<String>,
+  slot_save_delay_ms: u64,
+}
+
+/// The fixture's one slot.
+#[derive(Default)]
+struct Slot {
+  tokens: std::sync::atomic::AtomicU64,
+  /// Real llama-server reports `n_prompt_tokens` on `/slots` only for a slot
+  /// that has run a task, so a restored slot reports none until it serves.
+  ran_task: std::sync::atomic::AtomicBool,
+  saves: std::sync::atomic::AtomicU64,
+  /// A save is between its start and its reply.
+  saving: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +153,8 @@ fn parse_args() -> Args {
   let mut sigterm_exit_delay_ms = None;
   let mut print_env = Vec::new();
   let mut spec_mtp = false;
+  let mut slot_save_path = None;
+  let mut slot_save_delay_ms: u64 = 0;
   while let Some(arg) = args.next() {
     match arg.as_str() {
       "--host" => host = args.next().expect("--host needs value"),
@@ -150,6 +175,10 @@ fn parse_args() -> Args {
         sigterm_exit_delay_ms = args.next().and_then(|v| v.parse().ok());
       }
       "--print-env" => print_env.extend(args.next()),
+      "--slot-save-path" => slot_save_path = args.next(),
+      "--fake-slot-save-delay-ms" => {
+        slot_save_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+      }
       // Silently ignore unknown flags so the supervisor can pass
       // through reasoning bundles + advanced overrides without
       // teaching the fixture every llama-server flag.
@@ -168,6 +197,8 @@ fn parse_args() -> Args {
     sigterm_exit_delay_ms,
     print_env,
     spec_mtp,
+    slot_save_path,
+    slot_save_delay_ms,
   }
 }
 
@@ -270,6 +301,7 @@ async fn main() {
 
   let started_at = Arc::new(Instant::now());
   let args = Arc::new(args);
+  let slot = Arc::new(Slot::default());
   loop {
     let (sock, _) = match listener.accept().await {
       Ok(v) => v,
@@ -280,8 +312,9 @@ async fn main() {
     };
     let args = Arc::clone(&args);
     let started_at = Arc::clone(&started_at);
+    let slot = Arc::clone(&slot);
     tokio::spawn(async move {
-      if let Err(e) = handle(sock, args, started_at).await {
+      if let Err(e) = handle(sock, args, started_at, slot).await {
         eprintln!("connection error: {e}");
       }
     });
@@ -292,7 +325,9 @@ async fn handle(
   mut sock: TcpStream,
   args: Arc<Args>,
   started_at: Arc<Instant>,
+  slot: Arc<Slot>,
 ) -> std::io::Result<()> {
+  use std::sync::atomic::Ordering;
   let (rd, mut wr) = sock.split();
   let mut br = BufReader::new(rd);
   let mut request_line = String::new();
@@ -375,6 +410,98 @@ async fn handle(
       )
       .await?;
     }
+    ("GET", "/slots") => {
+      let mut row = serde_json::json!({
+        "id": 0,
+        "n_ctx": args.ctx.or(args.fit_ctx).unwrap_or(4096),
+        "is_processing": false,
+      });
+      if slot.ran_task.load(Ordering::SeqCst) {
+        row["n_prompt_tokens"] = slot.tokens.load(Ordering::SeqCst).into();
+      }
+      let body = serde_json::json!([row]);
+      write_response(
+        &mut wr,
+        200,
+        "application/json",
+        body.to_string().as_bytes(),
+      )
+      .await?;
+    }
+    ("GET", "/fake/slot") => {
+      let body = serde_json::json!({
+        "tokens": slot.tokens.load(Ordering::SeqCst),
+        "saves": slot.saves.load(Ordering::SeqCst),
+        "saving": slot.saving.load(Ordering::SeqCst),
+      });
+      write_response(
+        &mut wr,
+        200,
+        "application/json",
+        body.to_string().as_bytes(),
+      )
+      .await?;
+    }
+    ("POST", p) if p.starts_with("/slots/0?action=") => {
+      let action = p.trim_start_matches("/slots/0?action=");
+      let file = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("filename")?.as_str().map(str::to_string));
+      let (status, reply) = match (args.slot_save_path.as_deref(), file) {
+        (None, _) => (
+          501,
+          serde_json::json!({"error": {"code": 501, "type": "not_supported_error",
+            "message": "This server does not support slots action. Start it with `--slot-save-path`"}}),
+        ),
+        (Some(_), None) => (
+          400,
+          serde_json::json!({"error": {"code": 400, "message": "Invalid filename"}}),
+        ),
+        (Some(dir), Some(file)) => {
+          let path = std::path::Path::new(dir).join(&file);
+          if action == "save" {
+            slot.saving.store(true, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(args.slot_save_delay_ms)).await;
+            let tokens = slot.tokens.load(Ordering::SeqCst);
+            let payload = tokens.to_string();
+            std::fs::write(&path, &payload)?;
+            slot.saves.fetch_add(1, Ordering::SeqCst);
+            slot.saving.store(false, Ordering::SeqCst);
+            (
+              200,
+              serde_json::json!({"id_slot": 0, "filename": file, "n_saved": tokens,
+                "n_written": payload.len(), "timings": {"save_ms": 0.1}}),
+            )
+          } else {
+            match std::fs::read_to_string(&path)
+              .ok()
+              .and_then(|s| s.parse::<u64>().ok())
+            {
+              Some(tokens) => {
+                slot.tokens.store(tokens, Ordering::SeqCst);
+                (
+                  200,
+                  serde_json::json!({"id_slot": 0, "filename": file, "n_restored": tokens,
+                    "n_read": tokens.to_string().len(), "timings": {"restore_ms": 0.1}}),
+                )
+              }
+              None => (
+                400,
+                serde_json::json!({"error": {"code": 400, "type": "invalid_request_error",
+                  "message": "Unable to restore slot: No available space in KV cache or invalid slot save file"}}),
+              ),
+            }
+          }
+        }
+      };
+      write_response(
+        &mut wr,
+        status,
+        "application/json",
+        reply.to_string().as_bytes(),
+      )
+      .await?;
+    }
     ("GET", "/v1/models") => {
       let body = serde_json::json!({
         "object": "list",
@@ -411,6 +538,10 @@ async fn handle(
       // request body. The latter is convenient when the test
       // drives `spawn_chat_stream` which builds the URL itself.
       let body_text = std::str::from_utf8(&body).unwrap_or("");
+      // The slot now holds this prompt. One token per body byte is enough for
+      // a test to tell a saved prompt from an empty slot.
+      slot.tokens.store(body.len() as u64, Ordering::SeqCst);
+      slot.ran_task.store(true, Ordering::SeqCst);
       let want_fail = query.contains("fail=400") || body_text.contains("__TEST_INJECT_FAIL_400__");
       let want_malformed =
         query.contains("malformed-sse=1") || body_text.contains("__TEST_INJECT_MALFORMED_SSE__");

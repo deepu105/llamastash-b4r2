@@ -32,8 +32,15 @@
 //!
 //! A global `proxy.idle_ttl_secs = 0` disables the sweep unless some
 //! preset pins its own TTL; per-launch `0` always means "never unload".
+//!
+//! **Before the stop.** Both policies first hand the launch to its backend
+//! (`Backend::before_evict`), which may write out state worth keeping across
+//! the unload. The launch keeps serving meanwhile, so it is checked for
+//! idleness again afterwards and left running if a request arrived. An
+//! `Evictions` claim keeps a second pass off a launch one is already
+//! working on.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,6 +60,55 @@ const EVICT_STOP_GRACE: Duration = Duration::from_secs(5);
 /// free before re-running admission anyway, at the default 1 s sampler tick.
 /// A slower tick stretches it: see [`room_wait_window`].
 const MAKE_ROOM_FREE_WAIT: Duration = Duration::from_secs(20);
+
+/// The launches an eviction is working on, from the `before_evict` call to the
+/// end of the stop.
+///
+/// The backend's `before_evict` can take seconds, and the launch is still
+/// `Ready` and idle for all of it. Without the claim the next sweep tick, or a
+/// make-room pass, would pick the same launch again and stop it mid-write.
+#[derive(Clone, Default)]
+pub(crate) struct Evictions(Arc<std::sync::Mutex<HashSet<LaunchId>>>);
+
+impl Evictions {
+  /// Claim `id`, or `None` when an eviction already holds it. Released when
+  /// the claim drops.
+  fn claim(&self, id: &LaunchId) -> Option<EvictionClaim> {
+    let fresh = self
+      .0
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .insert(id.clone());
+    fresh.then(|| EvictionClaim {
+      set: self.clone(),
+      id: id.clone(),
+    })
+  }
+
+  fn in_flight(&self, id: &LaunchId) -> bool {
+    self
+      .0
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .contains(id)
+  }
+}
+
+pub(crate) struct EvictionClaim {
+  set: Evictions,
+  id: LaunchId,
+}
+
+impl Drop for EvictionClaim {
+  fn drop(&mut self) {
+    self
+      .set
+      .0
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .remove(&self.id);
+  }
+}
 
 /// Run the eviction loop until the shutdown token fires. Sleeps for
 /// `cadence` between sweeps. Per-sweep work is bounded by the size
@@ -170,6 +226,7 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
             "proxy eviction: unloading idle {} (umbrella stays up)",
             target.as_str()
           );
+          before_evict(&ctx, target).await;
           stop_launch(&ctx, target).await;
         }
       });
@@ -194,6 +251,10 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
     {
       continue;
     }
+    // An earlier pass, or make-room, is still evicting this launch.
+    let Some(claim) = state.evictions.claim(&launch_id) else {
+      continue;
+    };
     log::info!(
       "proxy eviction: stopping {launch_id} ({served}) — idle {idle:?} >= ttl {ttl:?}",
       launch_id = launch_id.as_str(),
@@ -202,9 +263,16 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
     );
     let ctx = state.ctx.clone();
     tokio::spawn(async move {
+      let _claim = claim;
       // The snapshot is a moment old by the time this runs: a request that
-      // landed in that window must not be cut off mid-generation.
-      if !matches!(model.state().await, ManagedState::Ready) || model.inflight() > 0 {
+      // landed in that window must not be cut off mid-generation. The launch
+      // also serves through `before_evict`, so it is checked on both sides.
+      let mut idle = still_idle(&model).await;
+      if idle {
+        before_evict(&ctx, &launch_id).await;
+        idle = still_idle(&model).await;
+      }
+      if !idle {
         log::debug!(
           "proxy eviction: {} busy again — left running",
           launch_id.as_str()
@@ -229,6 +297,20 @@ async fn stop_launch(ctx: &crate::daemon::context::MethodContext, launch_id: &La
   let _ = backend
     .stop(ctx, launch_id, EVICT_STOP_GRACE.as_secs())
     .await;
+}
+
+/// Whether `model` can still be stopped without cutting a request off.
+async fn still_idle(model: &ManagedModel) -> bool {
+  matches!(model.state().await, ManagedState::Ready) && model.inflight() == 0
+}
+
+/// Give a launch's backend its turn before the eviction stops it. Resolved the
+/// same way [`stop_launch`] resolves the owner, so neither policy knows which
+/// backends have anything to keep.
+async fn before_evict(ctx: &crate::daemon::context::MethodContext, launch_id: &LaunchId) {
+  use crate::backend::Backend;
+  let backend = crate::daemon::launch_service::backend_for_launch(ctx, launch_id).await;
+  backend.before_evict(ctx, launch_id).await;
 }
 
 /// The rows living inside a managed multiplexer: a delegated launch shares the
@@ -413,15 +495,38 @@ pub async fn make_room(
     crate::launch::admission::human_gib(freed),
     crate::launch::admission::human_gib(refusal.demand_bytes),
   );
+  let ctx = &state.ctx;
+  // Claimed until this returns. A pick the sweep claimed first is dropped here
+  // and counts as busy below.
+  let mut claims: Vec<EvictionClaim> = Vec::new();
+  picked.retain(|candidate| {
+    let held: Vec<EvictionClaim> = candidate
+      .targets
+      .iter()
+      .filter_map(|id| state.evictions.claim(id))
+      .collect();
+    let all = held.len() == candidate.targets.len();
+    if all {
+      claims.extend(held);
+    }
+    all
+  });
+  // The backends' turn comes before the re-check, not after it: the launches
+  // serve through it, and the re-check has to be the last thing before the
+  // stops. Together, so the request waits for the slowest one, not the sum.
+  futures::future::join_all(picked.iter().map(|candidate| async move {
+    for target in &candidate.targets {
+      before_evict(ctx, target).await;
+    }
+  }))
+  .await;
   // Every pick is re-checked before any stop starts, and all-or-nothing is
   // decided again on what survives: giving up the whole plan is better than
   // unloading half of it for a launch that still will not fit.
   let mut go: Vec<RoomCandidate> = Vec::new();
   let mut freed_now = 0u64;
   for candidate in picked {
-    if !matches!(candidate.guard.state().await, ManagedState::Ready)
-      || candidate.guard.inflight() > 0
-    {
+    if !still_idle(&candidate.guard).await {
       log::info!(
         "proxy make-room: {} is busy again — left it running",
         candidate.targets[0].as_str(),
@@ -439,7 +544,6 @@ pub async fn make_room(
     );
     return false;
   }
-  let ctx = &state.ctx;
   let targets: Vec<LaunchId> = go.iter().flat_map(|c| c.targets.iter().cloned()).collect();
   unloading(&targets);
   let unloaded = targets.len();
@@ -509,6 +613,10 @@ async fn room_candidates(
       continue;
     }
     if ttls.get(&launch_id).is_some_and(Duration::is_zero) {
+      continue;
+    }
+    // The sweep is already unloading it; its memory is not this pass's to count.
+    if state.evictions.in_flight(&launch_id) {
       continue;
     }
     let Some(row) = running
@@ -603,6 +711,21 @@ fn room_wait_window(sample_interval: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn an_eviction_claim_is_exclusive_until_it_drops() {
+    let evictions = Evictions::default();
+    let (a, b) = (LaunchId::from_counter(1), LaunchId::from_counter(2));
+    let first = evictions.claim(&a).expect("free");
+    assert!(evictions.claim(&a).is_none(), "already being evicted");
+    assert!(evictions.in_flight(&a));
+    let other = evictions.claim(&b).expect("another launch is unaffected");
+    drop(first);
+    assert!(!evictions.in_flight(&a));
+    assert!(evictions.claim(&a).is_some(), "released with the claim");
+    drop(other);
+    assert!(!evictions.in_flight(&b));
+  }
 
   #[test]
   fn room_wait_outlasts_two_sampler_ticks() {

@@ -428,7 +428,12 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 4: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
-- [ ] Keep a model's prompt cache across an unload
+- [x] ~~Keep a model's prompt cache across an unload~~ Done: the idle sweep and make-room save a llama.cpp chat launch's slots before stopping it, and the next launch restores them before it is ready (`backend.llamacpp.slot_save`). Numbers in [`docs/spikes/2026-10-10-slot-save-restore.md`](docs/spikes/2026-10-10-slot-save-restore.md), design in `docs/architecture.md` § Model lifecycle.
+- [ ] Slot save: measure a restore on an MTP model. Launches that run speculative decoding are left out (`speculates` in `src/backend/llama_cpp/slot_save.rs`) because a slot file has no draft-context state: with `draft-simple` the reply was unchanged but accepted drafts fell from 42 of 42 to 38 of 57. Check the follow-up request succeeds and compare draft acceptance before and after, then lift the skip or keep it with the numbers.
+- [ ] Slot save: run it on a large model on real hardware (`docs/testing/hardware-uat.md`). Every measurement so far is a 1B model on NVMe. Wanted: file size against the `kv_bytes` estimate, and how long a save holds up a make-room request.
+- [ ] Slot save: nothing outside the daemon log shows what is saved or how much disk it uses. Add the saved sets (model, tokens, bytes, age) to `status --json`, and a `doctor` line when the directory is near `max_gib`.
+- [ ] Slot save: conversations llama-server has moved to its in-memory prompt cache (`--cache-ram`) are not in any slot at eviction time, so only the slot that served last is normally saved. Restoring more than one conversation needs upstream support for saving that cache.
+- [ ] Slot save: not run with a multimodal projector. llama-server serializes media chunks into the slot file; confirm a restore with an image in the history.
 - [ ] Warm the page cache before a load (`llamastash warm <model>`)
 
 ### Batch 5: CLI setup commands ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-5-cli-setup-commands))

@@ -186,6 +186,8 @@ The default port is `11435` (one above Ollama's well-known `11434`) so a llamast
 
 If the named model isn't running yet, the proxy auto-starts it. If the launch fails and another model is already `Ready`, the proxy falls back to it and tags the response with `x-llamastash-served-by` + `x-llamastash-fallback-reason` (`launch_failed` for in-family substitution, `family_mismatch` for cross-arch picks) so clients can audit the substitution. The listener is enabled by default; flip `proxy.enabled: false` in `config.yaml` to turn it off.
 
+A model the proxy unloads, for being idle or to make room for another, keeps its prompt cache. The llama.cpp slots are saved to disk before the stop and restored when the model next starts, so a long conversation is not reprocessed from the first token: at 100k tokens that is about a second each way instead of 50 s to 53 min. See [`docs/usage.md` § Prompt cache across an unload](docs/usage.md#prompt-cache-across-an-unload).
+
 The full endpoint table, error envelopes, response headers, and config keys live in [`docs/usage.md` § Proxy (OpenAI-compatible listener)](docs/usage.md#proxy-openai-compatible-listener); the manual OpenCode + Pi smoke runbook is at [`tests/proxy_real_client_smoke.md`](https://github.com/llamastash/llamastash/blob/main/tests/proxy_real_client_smoke.md).
 
 ### Anthropic Messages API (Claude Code)

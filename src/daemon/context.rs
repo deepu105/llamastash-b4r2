@@ -130,6 +130,10 @@ pub struct MethodContext {
   /// configured" from "preload has nothing to start"; the entries themselves are
   /// what [`crate::daemon::preload`] resolved against the catalog at boot.
   pub preload: Arc<Vec<String>>,
+  /// The daemon's cache directory (`logs/` sits in it). A backend that keeps
+  /// reproducible per-launch files between runs puts them under here. `None`
+  /// in contexts built without a daemon, where nothing is written.
+  pub cache_dir: Option<PathBuf>,
 }
 
 /// Wrapper around the in-memory `DaemonState` plus the directory
@@ -300,7 +304,14 @@ impl MethodContext {
       backend_force: std::collections::BTreeMap::new(),
       admission: Arc::new(crate::launch::admission::Ledger::default()),
       preload: Arc::new(Vec::new()),
+      cache_dir: None,
     }
+  }
+
+  /// Builder helper: set the daemon's cache directory.
+  pub fn with_cache_dir(mut self, dir: PathBuf) -> Self {
+    self.cache_dir = Some(dir);
+    self
   }
 
   /// Builder helper: record the `daemon.preload:` list the daemon was started
