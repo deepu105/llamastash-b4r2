@@ -458,7 +458,7 @@ pub fn prepare_launch_dir(cfg: &PromptCacheConfig, params: &mut LaunchParams) {
   };
   // llama-server refuses a `--slot-save-path` that is not a directory, so create
   // it here rather than lose the launch to a missing path.
-  if let Err(e) = std::fs::create_dir_all(&dir) {
+  if let Err(e) = create_private_dir(&dir) {
     log::warn!("prompt cache: cannot create {}: {e}", dir.display());
     return;
   }
@@ -466,6 +466,23 @@ pub fn prepare_launch_dir(cfg: &PromptCacheConfig, params: &mut LaunchParams) {
     LLAMACPP_KNOB_PROMPT_CACHE_DIR.to_string(),
     dir.display().to_string(),
   );
+}
+
+/// `create_dir_all` plus mode 0700 on the leaf.
+///
+/// A slot file holds what was in the conversation. The engine writes it with its own
+/// umask, so the directory is where the contents get protected: without execute for
+/// group and other, nothing else can reach the file inside it.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+  std::fs::create_dir_all(dir)?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+  }
+  #[cfg(not(unix))]
+  let _ = dir;
+  Ok(())
 }
 
 /// Whether `--slot-save-path` belongs on this launch's argv.
@@ -820,6 +837,20 @@ mod tests {
       max_bytes: 1000,
       max_age_secs: 100,
     }
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn the_slot_directory_keeps_everyone_else_out() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("prompt-cache/llamacpp/a85838d46bac9c74");
+    create_private_dir(&dir).unwrap();
+    assert_eq!(
+      std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+      0o700,
+      "a slot file holds the conversation, so nothing else may traverse in"
+    );
   }
 
   #[test]
