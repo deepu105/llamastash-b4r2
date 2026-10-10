@@ -17,10 +17,12 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+pub mod prompt_cache;
 mod telemetry;
 
 use compose::compose;
 pub use list_devices::{parse_list_devices, probe_devices, BinaryDevice};
+pub use prompt_cache::PromptCacheConfig;
 
 use std::path::{Path, PathBuf};
 
@@ -160,6 +162,10 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Keep a launch's prompt cache across a proxy eviction: save its slots to
+  /// disk before the stop, restore them on the next start.
+  #[serde(default)]
+  pub prompt_cache: PromptCacheConfig,
 }
 
 fn default_true() -> bool {
@@ -178,6 +184,7 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      prompt_cache: PromptCacheConfig::default(),
     }
   }
 }
@@ -374,18 +381,29 @@ impl Backend for LlamaCppBackend {
   }
 
   fn probe_caps(&self, binary: &Path) -> std::collections::BTreeMap<String, String> {
+    let help = caps::help_text(binary).unwrap_or_default();
     let mut caps = std::collections::BTreeMap::new();
     caps.insert(
       CAP_LOAD_MODE_DIALECT.to_string(),
-      caps::LoadModeDialect::probe(binary).label().to_string(),
+      caps::LoadModeDialect::from_help(&help).label().to_string(),
+    );
+    caps.insert(
+      prompt_cache::CAP_SLOT_SAVE.to_string(),
+      prompt_cache::supported_in_help(&help).to_string(),
     );
     caps
   }
 
   fn seed_binary_caps(&self, binary: &Path, servers: &[super::Server], params: &mut LaunchParams) {
-    let dialect = match servers.iter().find(|s| s.binary == binary) {
-      Some(server) => caps::LoadModeDialect::from_label(
-        server.caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str),
+    let (dialect, slot_save) = match servers.iter().find(|s| s.binary == binary) {
+      Some(server) => (
+        caps::LoadModeDialect::from_label(
+          server.caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str),
+        ),
+        server
+          .caps
+          .get(prompt_cache::CAP_SLOT_SAVE)
+          .is_some_and(|v| v == "true"),
       ),
       // The binary should always be a catalog row (`configured_servers` adds the
       // daemon's resolved default), so a miss means the catalog and the launch
@@ -396,13 +414,18 @@ impl Backend for LlamaCppBackend {
           "{} is not in the server catalog; probing its flags directly",
           binary.display()
         );
-        caps::LoadModeDialect::probe(binary)
+        let help = caps::help_text(binary).unwrap_or_default();
+        (
+          caps::LoadModeDialect::from_help(&help),
+          prompt_cache::supported_in_help(&help),
+        )
       }
     };
     params.launch_config.insert(
       LLAMACPP_KNOB_LOAD_MODE_DIALECT.to_string(),
       dialect.label().to_string(),
     );
+    prompt_cache::confirm(params, slot_save);
   }
 
   fn launch_priority(&self) -> i32 {
@@ -463,6 +486,7 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+    prompt_cache::seed(&cfg.prompt_cache, params);
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {
@@ -501,6 +525,14 @@ impl Backend for LlamaCppBackend {
   ) -> crate::daemon::actuals::Actuals {
     // The llama-server-specific `/props` fetch + `n_ctx` parse.
     actuals::fetch_props_actuals(port, timeout).await
+  }
+
+  async fn before_evict(&self, params: &LaunchParams, port: u16) {
+    prompt_cache::save(params, port).await;
+  }
+
+  async fn after_ready(&self, params: &LaunchParams, port: u16) {
+    prompt_cache::restore(params, port).await;
   }
 
   fn gpu_resident(&self, params: &LaunchParams, layer_count: Option<u64>) -> bool {
@@ -594,6 +626,84 @@ mod tests {
       backend.rewrite_request_body(&ctx, "/v1/messages", body.as_bytes()),
       None,
       "off means the client's bytes go through untouched"
+    );
+  }
+
+  fn server_with_caps(binary: &str, caps: &[(&str, &str)]) -> crate::backend::Server {
+    crate::backend::Server {
+      id: "llamacpp".into(),
+      backend_id: "llamacpp".into(),
+      binary: PathBuf::from(binary),
+      name: "llamacpp".into(),
+      devices: Vec::new(),
+      caps: caps
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    }
+  }
+
+  /// A build without `--slot-save-path` rejects the whole argv, so the slot
+  /// directory must reach `compose` only for a binary that advertised the flag.
+  #[test]
+  fn slot_save_path_is_emitted_only_for_a_build_that_advertises_it() {
+    let cache = crate::util::test_temp::unique_temp_dir("llamacpp-slot-cap");
+    let backend = LlamaCppBackend::new();
+    let binary = Path::new("/bin/llama-server");
+    let argv_for = |caps: &[(&str, &str)]| {
+      let mut params = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
+      prompt_cache::seed_into(
+        &PromptCacheConfig::default(),
+        Some(cache.clone()),
+        &mut params,
+      );
+      backend.seed_binary_caps(
+        binary,
+        &[server_with_caps("/bin/llama-server", caps)],
+        &mut params,
+      );
+      compose(&params, 8080)
+    };
+    let has_flag = |argv: &[OsString]| argv.iter().any(|a| a == "--slot-save-path");
+
+    let supported = argv_for(&[(prompt_cache::CAP_SLOT_SAVE, "true")]);
+    let at = supported
+      .iter()
+      .position(|a| a == "--slot-save-path")
+      .expect("flag emitted");
+    assert_eq!(
+      PathBuf::from(&supported[at + 1]),
+      cache.join("slot-cache"),
+      "the flag carries the seeded directory"
+    );
+    assert!(!has_flag(&argv_for(&[(
+      prompt_cache::CAP_SLOT_SAVE,
+      "false"
+    )])));
+    assert!(
+      !has_flag(&argv_for(&[])),
+      "a catalog row probed before this cap existed reads as unsupported"
+    );
+    let _ = std::fs::remove_dir_all(&cache);
+  }
+
+  #[test]
+  fn seed_launch_knobs_follows_the_prompt_cache_switch() {
+    let mut ctx =
+      crate::daemon::context::MethodContext::new(crate::daemon::shutdown::ShutdownToken::new());
+    let backend = LlamaCppBackend::new();
+    let mut params = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
+    params.launch_config.insert(
+      prompt_cache::LLAMACPP_KNOB_SLOT_SAVE_DIR.into(),
+      "/inherited/from/last_params".into(),
+    );
+    ctx.backend.llamacpp.prompt_cache.enabled = false;
+    backend.seed_launch_knobs(&ctx, &mut params);
+    assert!(
+      !params
+        .launch_config
+        .contains_key(prompt_cache::LLAMACPP_KNOB_SLOT_SAVE_DIR),
+      "switching the feature off must drop a directory inherited from last_params"
     );
   }
 

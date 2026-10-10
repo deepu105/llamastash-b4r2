@@ -25,6 +25,13 @@
 //! - `--print-env <VAR>` (test-only, repeatable — print `env VAR=<value>` to
 //!   stdout at start, so a test can read the child's environment from its log)
 //! - `--print-argv` (test-only — print `argv <args…>` to stdout at start)
+//! - `--slot-save-path <DIR>` (enables `GET /slots` and
+//!   `POST /slots/0?action=save|restore`, the way the real flag does; a save
+//!   writes the slot's token count into `DIR/<filename>` and a restore reads it
+//!   back, logging one `slot 0: saved|restored` line to stderr)
+//! - `--fake-slot-tokens <N>` (test-only: the slot starts out holding N
+//!   prompt tokens, as if a conversation had run)
+//! - `--fake-slot-save-delay-ms <N>` (test-only: a save takes N ms)
 //! - `--list-devices` (one-shot, mirrors real `llama-server`: prints a
 //!   fake adapter table and exits *without* serving). The number of
 //!   adapters comes from the `FAKE_LLAMA_DEVICES` env var, default `0`
@@ -42,6 +49,7 @@
 //! can wait for that signal if they want.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -72,6 +80,11 @@ struct Args {
   /// a real llama-server after generation — the fixture the status
   /// draft-acceptance scan asserts against.
   spec_mtp: bool,
+  slot_save_path: Option<String>,
+  slot_save_delay_ms: u64,
+  /// Prompt tokens the one slot holds: `--fake-slot-tokens` at start, then
+  /// whatever a restore read back.
+  slot_tokens: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +143,9 @@ fn parse_args() -> Args {
   let mut sigterm_exit_delay_ms = None;
   let mut print_env = Vec::new();
   let mut spec_mtp = false;
+  let mut slot_save_path = None;
+  let mut slot_save_delay_ms = 0;
+  let mut slot_tokens = 0;
   while let Some(arg) = args.next() {
     match arg.as_str() {
       "--host" => host = args.next().expect("--host needs value"),
@@ -150,6 +166,13 @@ fn parse_args() -> Args {
         sigterm_exit_delay_ms = args.next().and_then(|v| v.parse().ok());
       }
       "--print-env" => print_env.extend(args.next()),
+      "--slot-save-path" => slot_save_path = args.next(),
+      "--fake-slot-tokens" => {
+        slot_tokens = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+      }
+      "--fake-slot-save-delay-ms" => {
+        slot_save_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+      }
       // Silently ignore unknown flags so the supervisor can pass
       // through reasoning bundles + advanced overrides without
       // teaching the fixture every llama-server flag.
@@ -168,6 +191,9 @@ fn parse_args() -> Args {
     sigterm_exit_delay_ms,
     print_env,
     spec_mtp,
+    slot_save_path,
+    slot_save_delay_ms,
+    slot_tokens: Arc::new(AtomicU64::new(slot_tokens)),
   }
 }
 
@@ -375,6 +401,30 @@ async fn handle(
       )
       .await?;
     }
+    ("GET", "/slots") => {
+      let body = serde_json::json!([{
+        "id": 0,
+        "is_processing": false,
+        "n_prompt_tokens": args.slot_tokens.load(Ordering::SeqCst),
+      }]);
+      write_response(
+        &mut wr,
+        200,
+        "application/json",
+        body.to_string().as_bytes(),
+      )
+      .await?;
+    }
+    ("POST", "/slots/0?action=save") | ("POST", "/slots/0?action=restore") => {
+      let (status, reply) = slot_action(&args, path.ends_with("save"), &body).await;
+      write_response(
+        &mut wr,
+        status,
+        "application/json",
+        reply.to_string().as_bytes(),
+      )
+      .await?;
+    }
     ("GET", "/v1/models") => {
       let body = serde_json::json!({
         "object": "list",
@@ -575,6 +625,48 @@ async fn handle(
 fn extract_body_model(body: &str) -> Option<String> {
   let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
   parsed.get("model")?.as_str().map(|s| s.to_string())
+}
+
+/// `POST /slots/0?action=save|restore`, shaped like llama-server's replies.
+async fn slot_action(args: &Args, save: bool, body: &[u8]) -> (u16, serde_json::Value) {
+  let error = |code: u16, message: &str| {
+    (
+      code,
+      serde_json::json!({ "error": { "code": code, "message": message } }),
+    )
+  };
+  let Some(dir) = &args.slot_save_path else {
+    return error(501, "This server does not support slots action");
+  };
+  let filename = serde_json::from_slice::<serde_json::Value>(body)
+    .ok()
+    .and_then(|v| v["filename"].as_str().map(str::to_string))
+    .unwrap_or_default();
+  let file = std::path::Path::new(dir).join(&filename);
+  if save {
+    tokio::time::sleep(std::time::Duration::from_millis(args.slot_save_delay_ms)).await;
+    let tokens = args.slot_tokens.load(Ordering::SeqCst);
+    if std::fs::write(&file, tokens.to_string()).is_err() {
+      return error(500, "Unable to save slot");
+    }
+    eprintln!("slot 0: saved {tokens} tokens to {filename}");
+    return (
+      200,
+      serde_json::json!({ "id_slot": 0, "filename": filename, "n_saved": tokens, "n_written": 64 }),
+    );
+  }
+  let Some(tokens) = std::fs::read_to_string(&file)
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok())
+  else {
+    return error(400, "Unable to restore slot");
+  };
+  args.slot_tokens.store(tokens, Ordering::SeqCst);
+  eprintln!("slot 0: restored {tokens} tokens from {filename}");
+  (
+    200,
+    serde_json::json!({ "id_slot": 0, "filename": filename, "n_restored": tokens, "n_read": 64 }),
+  )
 }
 
 async fn write_response<W>(wr: &mut W, status: u16, ctype: &str, body: &[u8]) -> std::io::Result<()>

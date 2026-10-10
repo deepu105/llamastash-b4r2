@@ -424,6 +424,24 @@ pub trait Backend {
     crate::daemon::actuals::Actuals::default()
   }
 
+  /// Called by a proxy eviction (the idle sweep or make-room) on a supervised
+  /// launch it is about to stop, while the engine still answers on `port`.
+  /// Not called for a manual stop or a daemon shutdown.
+  ///
+  /// Default: nothing. A backend that can carry state across the unload writes
+  /// it out here. The eviction waits for this to return, so an implementation
+  /// bounds its own time; make-room has a client waiting behind it.
+  async fn before_evict(&self, _params: &LaunchParams, _port: u16) {}
+
+  /// Called once by the supervisor after the readiness probe passes and before
+  /// the launch is published `Ready`, so no request has reached the engine yet.
+  ///
+  /// Default: nothing. The counterpart of [`Backend::before_evict`]: a backend
+  /// reads back what an earlier eviction of the same launch wrote. The launch
+  /// stays `Loading` until this returns, so an implementation bounds its own
+  /// time.
+  async fn after_ready(&self, _params: &LaunchParams, _port: u16) {}
+
   /// Whether `extras` already configures speculative decoding by hand, in which
   /// case llamastash defers entirely and adds none of its own (KD3).
   ///
@@ -1171,6 +1189,14 @@ impl Backend for Backends {
     timeout: std::time::Duration,
   ) -> crate::daemon::actuals::Actuals {
     for_each_backend!(self, b => b.fetch_actuals(port, timeout).await)
+  }
+
+  async fn before_evict(&self, params: &LaunchParams, port: u16) {
+    for_each_backend!(self, b => b.before_evict(params, port).await)
+  }
+
+  async fn after_ready(&self, params: &LaunchParams, port: u16) {
+    for_each_backend!(self, b => b.after_ready(params, port).await)
   }
 
   fn speculation_set_in_extras(&self, extras: &[OsString]) -> bool {

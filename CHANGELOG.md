@@ -6,6 +6,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Added
 
+- **Prompt cache kept across an unload.** When the proxy unloads an idle llama.cpp model, or unloads one to make room, it saves the model's `llama-server` slots to `<cache dir>/slot-cache/` and restores them on the next start, so a returning conversation does not reprocess its prompt. At 100k tokens on CPU the restore took about 1 s against 48 minutes to reprocess. On by default; `backend.llamacpp.prompt_cache` sets the size cap (32 GiB), the age limit (24 h) and the off switch. (@@PR@@)
 - The terminal bell rings when a pull, a `start --wait`, or a TUI-started launch ends, ready or failed. One bell per launch, never in piped or `--json` output; `bell: false` in `config.yaml` turns it off. ([#104](https://github.com/llamastash/llamastash/pull/104))
 - A `docs/usage.md` section for running the daemon as a login service: a systemd user unit (run live: preload comes up, `systemctl --user stop` unloads the models and takes its `llama-server` with it) and a launchd agent, both around `daemon start --foreground` with `daemon.preload`. ([#104](https://github.com/llamastash/llamastash/pull/104))
 - **Shell completions.** `llamastash completions <bash|zsh|fish|powershell|elvish>` prints a completion script built from the command spec: subcommands, flags and fixed value lists complete, model names do not. It needs no daemon and writes nothing.

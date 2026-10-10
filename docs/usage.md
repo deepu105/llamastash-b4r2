@@ -82,6 +82,11 @@ backend: # Per-engine config, one block per backend. llama.cpp is the
     strict_fit: false # Refuse (vs degrade) an unplaceable --fit. Env: LLAMASTASH_STRICT_FIT.
     jinja: true # Emit --jinja every launch (tool calling). Config-only.
     map_anthropic_effort: true # Map Anthropic output_config.effort to the engine kwarg. Config-only.
+    prompt_cache: # Save a launch's prompt cache when the proxy unloads it. See §"Prompt cache across an unload".
+      enabled: true
+      max_gb: 32 # Cap for <cache dir>/slot-cache; oldest files go first.
+      max_age_hours: 24 # Older files are deleted unrestored. 0 = no age limit.
+      min_tokens: 1024 # Smaller slots are not saved.
   lemonade:
     # servers: [{ binary: /opt/lemonade/lemond }] # lemond path; else PATH.
     # enabled: # tri-state: unset=auto, true=force on, false=force off.
@@ -1492,6 +1497,34 @@ Every non-2xx response carries an OpenAI-shaped JSON body:
 | 503  | `launch_failed`                                              | Auto-start failed and no Ready models exist for fallback. `running: []` is always present on this arm. The list reflects models that were **in `Ready` state at the moment the proxy snapshotted the supervisor registry for fallback** — models in `Launching` / `Loading` are not included, so an empty list does not mean "the daemon has nothing alive," only "no candidate was available for instant fallback." Retry once the slow launch completes. |
 
 Upstream non-2xx responses (e.g. `llama-server` returns 500 for a malformed completion request) are passed through verbatim — same status code, same body bytes; the OpenAI-shape envelope above only covers errors the proxy itself emits. Mid-stream upstream death: once headers are sent the routing decision is committed; if the upstream stream errors after that point, the proxy closes its connection to the agent (the agent sees a truncated SSE / chunked body) — no retry, no fallback.
+
+### Prompt cache across an unload
+
+When the proxy unloads a llama.cpp launch (the idle sweep after `proxy.idle_ttl_secs`, or make-room for another model), the next request for that model starts a new `llama-server`, and a new server reprocesses the whole prompt. With `backend.llamacpp.prompt_cache` on (the default) the daemon keeps the prompt cache on disk across the unload:
+
+1. Every chat launch is started with `--slot-save-path <cache dir>/slot-cache`.
+2. Before an eviction stops the launch, each idle slot that holds at least `min_tokens` prompt tokens is saved (`POST /slots/<id>?action=save`).
+3. The next start of the same model with the same launch settings restores those files (`action=restore`) while the launch is still `Loading`, then deletes them.
+4. llama-server gives a request to the slot whose cached tokens share the longest prefix with its prompt, so the returning conversation continues from the restored slot. The client changes nothing.
+
+Measured on CPU at 100,000 tokens (Llama-3.2-1B Q4_K_M, 8 threads, build 11525): reprocessing took 2,910 s (48.5 minutes), the save 0.72 s, the restore 0.57 s (1.26 s with the file read from disk), and the file is 3.05 GiB. Details: [`docs/spikes/2026-10-10-slot-save-restore.md`](spikes/2026-10-10-slot-save-restore.md).
+
+- **Only an eviction saves.** `llamastash stop`, `stop --all` and a daemon shutdown do not.
+- **Same launch only.** Files are keyed by the launch's argv plus the size and mtime of the model and projector files. A different context size, preset, LoRA, or a replaced model file starts cold.
+- **Disk.** Files live in `<cache dir>/slot-cache/` (`~/.cache/llamastash/slot-cache/` on Linux; `LLAMASTASH_CACHE_DIR` moves it), a directory with mode `0700`. They hold your prompts as tokens. A file exists only while its model is unloaded. The directory is capped at `max_gb`: a slot estimated above the cap is not saved, and past the cap the oldest files are deleted first. Files older than `max_age_hours` are deleted unrestored. A save is skipped when it would leave less than 2 GiB free.
+- **Time.** An eviction waits at most 60 s for its saves and a start waits at most 60 s for its restores. Past that the eviction or the start goes ahead without them.
+- **A request that arrives during the save keeps the model loaded.** The unload is called off.
+- **Not kept:** conversations llama-server had already moved out of a slot into its in-memory cache (`--cache-ram`), embedding and rerank launches, and other backends.
+- **In the log.** `<cache dir>/logs/llamastash.log` gets one line per slot on the way out and one on the way back:
+
+  ```
+  prompt cache: saved slot 3 of Llama-3.2-1B-Instruct-Q4_K_M.gguf: 15065 tokens, 471.0 MiB, 108 ms
+  prompt cache: restored slot 3 of Llama-3.2-1B-Instruct-Q4_K_M.gguf: 15065 tokens, 471.0 MiB, 67 ms
+  ```
+
+  In that run the request after the unload took 15,065 of its 15,082 prompt tokens from the cache and spent 1.0 s on the prompt. With `enabled: false` the same request reprocessed all 15,082 tokens in 92 s.
+
+Turn it off with `backend.llamacpp.prompt_cache.enabled: false` and a daemon restart. A launch that passes its own `--slot-save-path` in its extra arguments is left alone. A llama-server build without the flag runs as before.
 
 ### Configuration
 

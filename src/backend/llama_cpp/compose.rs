@@ -110,6 +110,15 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
     argv.push("--fit-ctx".into());
     argv.push(floor.to_string().into());
   }
+  // Set only when the build accepts the flag and the directory exists; the
+  // engine refuses to start on either miss.
+  if let Some(dir) = params
+    .launch_config
+    .get(super::prompt_cache::LLAMACPP_KNOB_SLOT_SAVE_DIR)
+  {
+    argv.push("--slot-save-path".into());
+    argv.push(dir.into());
+  }
   // Emit the device selector verbatim — exactly once. Empty / unset
   // means "let llama-server auto-select" (no flag).
   if let Some(sel) = params

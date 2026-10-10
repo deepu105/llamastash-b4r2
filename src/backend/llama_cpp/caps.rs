@@ -21,6 +21,33 @@ use std::time::Duration;
 /// hangs rather than prints. Matches the `--list-devices` probe.
 const HELP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// One binary's `--help`, or `None` when it will not answer. Every probe in
+/// this module reads the same text, so a caller with more than one question
+/// asks once.
+pub fn help_text(binary: &Path) -> Option<String> {
+  let mut cmd = Command::new(binary);
+  // The unified app takes server flags behind `serve`; `llama --help` prints
+  // the dispatcher's own help, which lists no server flags at all.
+  cmd.args(super::serve_prefix(binary));
+  cmd.arg("--help");
+  match crate::util::process::run_with_drain_and_timeout(cmd, HELP_TIMEOUT) {
+    // Some builds print help on stderr, some on stdout; read both rather
+    // than depending on which.
+    Ok(out) => Some(format!(
+      "{}{}",
+      String::from_utf8_lossy(&out.stdout),
+      String::from_utf8_lossy(&out.stderr)
+    )),
+    Err(e) => {
+      log::warn!(
+        "`{} --help` failed: {e:?}; assuming a build with none of the probed flags",
+        binary.display()
+      );
+      None
+    }
+  }
+}
+
 /// How a build spells "how should the model be loaded".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum LoadModeDialect {
@@ -42,30 +69,7 @@ impl LoadModeDialect {
   /// itself will reject the argv with a message naming the flag. Guessing
   /// `Enum` there would turn a clear rejection into a confusing one.
   pub fn probe(binary: &Path) -> Self {
-    let mut cmd = Command::new(binary);
-    // The unified app takes server flags behind `serve`; `llama --help` prints
-    // the dispatcher's own help, which lists no server flags at all.
-    cmd.args(super::serve_prefix(binary));
-    cmd.arg("--help");
-    match crate::util::process::run_with_drain_and_timeout(cmd, HELP_TIMEOUT) {
-      Ok(out) => {
-        // Some builds print help on stderr, some on stdout; read both rather
-        // than depending on which.
-        let text = format!(
-          "{}{}",
-          String::from_utf8_lossy(&out.stdout),
-          String::from_utf8_lossy(&out.stderr)
-        );
-        Self::from_help(&text)
-      }
-      Err(e) => {
-        log::warn!(
-          "`{} --help` failed: {e:?}; assuming the pre-`--load-mode` flags",
-          binary.display()
-        );
-        Self::Flags
-      }
-    }
+    help_text(binary).map_or(Self::Flags, |text| Self::from_help(&text))
   }
 
   /// The parse, split out so tests drive it with captured help text instead of

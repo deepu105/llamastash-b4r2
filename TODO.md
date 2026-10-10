@@ -428,7 +428,12 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 4: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
-- [ ] Keep a model's prompt cache across an unload
+- [x] ~~Keep a model's prompt cache across an unload~~, done: `backend.llamacpp.prompt_cache` (on by default). An eviction saves each llama-server slot that holds a prompt to `<cache dir>/slot-cache/` and the next start of the same launch restores it before `Ready`. At 100k tokens on CPU: reprocess 2,910 s (48.5 minutes), save 0.72 s, restore 0.57 s (1.26 s with the file read from disk), file 3.05 GiB ([spike](docs/spikes/2026-10-10-slot-save-restore.md)).
+- [ ] Prompt cache: real-hardware check on a GPU build with a large model, per `docs/testing/hardware-uat.md`. The spike and the end-to-end run were CPU-only on a 1B model. Measure save and restore with the KV cache in VRAM (`scripts/bench/slot_save_restore.py --server-arg=-ngl --server-arg=99`), and confirm the 60 s save and restore budgets in `src/backend/llama_cpp/prompt_cache.rs` hold for a file near the 32 GiB cap.
+- [ ] Prompt cache: conversations llama-server has already moved out of a slot into its in-memory cache (`--cache-ram`) are not saved. With the default unified KV, starting a task parks every other idle slot there, so an eviction usually saves only the last conversation.
+- [ ] Prompt cache: nothing reports the slot directory. Add its file count and size to `status --json` (`Backend::status_extra`) and a `doctor` line when it is near `max_gb`.
+- [ ] Prompt cache: decide whether a daemon shutdown should save too. Today only the idle sweep and make-room do; `stop`, `stop --all` and shutdown discard the cache, so a reboot or a daemon restart still costs a full reprocess.
+- [ ] Prompt cache: `--slot-save-path` turns on llama-server's `POST /slots/<id>?action=save|restore|erase`, and the proxy's `/ui/` path forwards to them like any other engine route. Decide whether `/ui/` should refuse them; noted in `SECURITY.md`.
 - [ ] Warm the page cache before a load (`llamastash warm <model>`)
 
 ### Batch 5: CLI setup commands ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-5-cli-setup-commands))

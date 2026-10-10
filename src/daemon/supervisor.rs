@@ -234,6 +234,10 @@ struct ManagedInner {
   /// supervisors with `inflight > 0` so a mid-stream generation
   /// can't get SIGTERM'd out from under the caller.
   inflight: std::sync::atomic::AtomicU64,
+  /// Set while a proxy eviction holds this launch. The backend's pre-stop
+  /// hook can take seconds, long enough for the next sweep to pick the same
+  /// launch again.
+  evicting: std::sync::atomic::AtomicBool,
   /// The backend's floor under every stop grace (see
   /// [`crate::backend::ProcessLaunchSpec::min_stop_grace`]).
   min_stop_grace: Duration,
@@ -288,6 +292,23 @@ impl ManagedModel {
       .inner
       .inflight
       .load(std::sync::atomic::Ordering::SeqCst)
+  }
+
+  /// Claim this launch for one eviction. `false` when another eviction already
+  /// holds it.
+  pub fn begin_evict(&self) -> bool {
+    !self
+      .inner
+      .evicting
+      .swap(true, std::sync::atomic::Ordering::SeqCst)
+  }
+
+  /// Give the launch back after an eviction that did not stop it.
+  pub fn end_evict(&self) {
+    self
+      .inner
+      .evicting
+      .store(false, std::sync::atomic::Ordering::SeqCst);
   }
 
   /// Increment `inflight` and return a guard. The guard's `Drop`
@@ -528,6 +549,7 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
     actuals: RwLock::new(super::actuals::Actuals::default()),
     origin: input.origin,
     inflight: std::sync::atomic::AtomicU64::new(0),
+    evicting: std::sync::atomic::AtomicBool::new(false),
     min_stop_grace: input.plan.min_stop_grace,
   });
   let model = ManagedModel { inner };
@@ -675,6 +697,12 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
           }
         }
         *probe_model.inner.actuals.write().await = actuals;
+        // Still `Loading`, so the proxy holds every request until this
+        // returns: whatever the backend reads back is in place before the
+        // first prompt arrives.
+        probe_backend
+          .after_ready(&probe_model.inner.params, probe_model.inner.port)
+          .await;
         let secs = SystemTime::now()
           .duration_since(UNIX_EPOCH)
           .map(|d| d.as_secs())
@@ -1087,6 +1115,7 @@ pub(crate) mod test_support {
         actuals: RwLock::new(crate::daemon::actuals::Actuals::default()),
         origin: LaunchOrigin::Manual,
         inflight: std::sync::atomic::AtomicU64::new(0),
+        evicting: std::sync::atomic::AtomicBool::new(false),
         min_stop_grace: Duration::ZERO,
         backend: crate::backend::Backends::from_id(crate::backend::DEFAULT_BACKEND_ID)
           .expect("the default backend is registered"),
@@ -1195,6 +1224,18 @@ mod tests {
 
   fn test_model(initial: ManagedState) -> ManagedModel {
     test_support::in_state(initial)
+  }
+
+  #[test]
+  fn an_eviction_claim_is_exclusive_until_released() {
+    let model = test_model(ManagedState::Ready);
+    assert!(model.begin_evict());
+    assert!(
+      !model.clone().begin_evict(),
+      "a second eviction of the same launch must back off"
+    );
+    model.end_evict();
+    assert!(model.begin_evict());
   }
 
   #[test]

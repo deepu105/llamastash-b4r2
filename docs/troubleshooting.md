@@ -197,6 +197,22 @@ llamastash requests <model>    # one model
 
 The `NOTE` column says what happened beyond the status code: the proxy's own error and its message (`model_not_found: ...`, `launch_failed: ...`, `upstream_unreachable: ...`), `auto-start` or `loading model` for a request that waited on a model load, `unloaded L3` when another launch was unloaded to make room, and `client closed` when the client gave up first. An error status with an empty `NOTE` came from the model's own server, so read `llamastash logs <launch-id>`. The TUI shows the same rows on the model's Requests tab (`Shift+Q`). See [`usage.md` § `llamastash requests`](usage.md#llamastash-requests-model-ref).
 
+## A conversation reprocesses its whole prompt after the model was unloaded
+
+**Symptom:** the first request after an idle unload is as slow as the first request ever, although [the prompt cache](usage.md#prompt-cache-across-an-unload) is on.
+
+**Fix:** read the daemon log for what the unload and the next start did:
+
+```bash
+grep 'prompt cache:' ~/.cache/llamastash/logs/llamastash.log | tail
+```
+
+- No `saved slot` line: the model was stopped by `llamastash stop` or a daemon shutdown (only an eviction saves), the slot held fewer than `min_tokens` tokens, or the `llama-server` build has no `--slot-save-path` (`llama-server --help | grep slot-save-path`).
+- `over the ... cap; not saved`: the slot is larger than `backend.llamacpp.prompt_cache.max_gb`. Raise it if the disk has room.
+- `free under ...; not saved`: the save would have left less than 2 GiB free on the cache filesystem.
+- `saved` but no `restored` on the next start: the launch settings changed (context size, preset, extra arguments) or the model file was replaced, so the file no longer belongs to that launch. Or it was older than `max_age_hours`.
+- `restored`, and the request is still slow: it was a different conversation. An eviction saves what the slots hold, which with the default settings is the last conversation only.
+
 ## Proxy returned a different model than I asked for
 
 **Symptom:** an agent gets a plausible response but the answer style doesn't match the requested model; response headers carry `x-llamastash-served-by: <other-model>` and `x-llamastash-fallback-reason: launch_failed` or `family_mismatch`.
