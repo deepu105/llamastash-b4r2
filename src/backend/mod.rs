@@ -424,6 +424,20 @@ pub trait Backend {
     crate::daemon::actuals::Actuals::default()
   }
 
+  /// Post-readiness, pre-`Ready` hook: the health probe passed but the launch
+  /// is not yet advertised to callers. A backend that can warm engine-side
+  /// state (a prompt cache, say) does it here so the first real request finds
+  /// it in place. Restore failures are the backend's to log; they must not
+  /// fail the launch. Default: no-op, no I/O.
+  async fn before_ready(&self, _port: u16, _params: &LaunchParams) {}
+
+  /// Eviction-side stop hook: called on the idle-sweep / make-room stop path
+  /// just before the launch is stopped, giving the backend a bounded chance
+  /// to persist state that outlives the process. A manual `stop` or a daemon
+  /// shutdown never calls it — user intent wins over cache warm-keeping.
+  /// Default: no-op.
+  async fn before_evict_stop(&self, _model: &crate::daemon::supervisor::ManagedModel) {}
+
   /// Whether `extras` already configures speculative decoding by hand, in which
   /// case llamastash defers entirely and adds none of its own (KD3).
   ///
@@ -1171,6 +1185,14 @@ impl Backend for Backends {
     timeout: std::time::Duration,
   ) -> crate::daemon::actuals::Actuals {
     for_each_backend!(self, b => b.fetch_actuals(port, timeout).await)
+  }
+
+  async fn before_ready(&self, port: u16, params: &LaunchParams) {
+    for_each_backend!(self, b => b.before_ready(port, params).await)
+  }
+
+  async fn before_evict_stop(&self, model: &crate::daemon::supervisor::ManagedModel) {
+    for_each_backend!(self, b => b.before_evict_stop(model).await)
   }
 
   fn speculation_set_in_extras(&self, extras: &[OsString]) -> bool {

@@ -17,6 +17,7 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+pub(crate) mod slot_cache;
 mod telemetry;
 
 use compose::compose;
@@ -49,6 +50,60 @@ pub const LLAMACPP_KNOB_FIT_CTX_FLOOR: &str = "fit_ctx_floor";
 pub const LLAMACPP_KNOB_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
 /// The same fact as a [`caps`] probe key on `Server::caps`.
 pub const CAP_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
+/// `launch_config` key carrying whether the resolved build accepts
+/// `--slot-save-path`. Written by `seed_binary_caps` from [`CAP_SLOT_SAVE`].
+pub const LLAMACPP_KNOB_SLOT_SAVE: &str = "slot_save_path";
+/// The same fact as a [`caps`] probe key on `Server::caps`.
+pub const CAP_SLOT_SAVE: &str = "slot_save_path";
+/// `launch_config` key carrying the per-model slot save directory. Written by
+/// [`LlamaCppBackend::seed_launch_knobs`] when `backend.llamacpp.slot_cache`
+/// is on; read by `compose` (to pass `--slot-save-path`) and by the
+/// save/restore hooks.
+pub const LLAMACPP_KNOB_SLOT_DIR: &str = "slot_cache_dir";
+/// `launch_config` keys carrying the slot cache cap and TTL, both integers as
+/// strings, seeded alongside [`LLAMACPP_KNOB_SLOT_DIR`].
+pub const LLAMACPP_KNOB_SLOT_MAX_BYTES: &str = "slot_cache_max_bytes";
+pub const LLAMACPP_KNOB_SLOT_TTL_SECS: &str = "slot_cache_ttl_secs";
+
+/// Factory default for `backend.llamacpp.slot_cache_max_mb` — the per-model
+/// cap on slot save files (a 100k-token Llama-3.2-1B-class slot is ~3.3 GB;
+/// measured 2026-10-10).
+pub const DEFAULT_SLOT_CACHE_MAX_MB: u64 = 4096;
+/// Factory default for `backend.llamacpp.slot_cache_ttl_days`.
+pub const DEFAULT_SLOT_CACHE_TTL_DAYS: u64 = 14;
+
+/// The slot-cache tuning read back off `launch_config`, `None` when the
+/// feature is off for this launch (config off, old binary, or a params set
+/// that predates the keys).
+struct SlotCacheTuning {
+  dir: PathBuf,
+  max_bytes: u64,
+  ttl: std::time::Duration,
+}
+
+fn slot_cache_tuning(params: &LaunchParams) -> Option<SlotCacheTuning> {
+  let cfg = &params.launch_config;
+  if cfg.get(LLAMACPP_KNOB_SLOT_SAVE).map(String::as_str) != Some("true") {
+    return None;
+  }
+  let dir = cfg.get(LLAMACPP_KNOB_SLOT_DIR).map(PathBuf::from)?;
+  let max_bytes = cfg
+    .get(LLAMACPP_KNOB_SLOT_MAX_BYTES)
+    .and_then(|s| s.parse().ok())
+    .unwrap_or(DEFAULT_SLOT_CACHE_MAX_MB.saturating_mul(1 << 20));
+  let ttl = cfg
+    .get(LLAMACPP_KNOB_SLOT_TTL_SECS)
+    .and_then(|s| s.parse::<u64>().ok())
+    .map(std::time::Duration::from_secs)
+    .unwrap_or(std::time::Duration::from_secs(
+      DEFAULT_SLOT_CACHE_TTL_DAYS.saturating_mul(86_400),
+    ));
+  Some(SlotCacheTuning {
+    dir,
+    max_bytes,
+    ttl,
+  })
+}
 
 /// The `fit_ctx_floor` launch knob parsed to `u32`, or `None` when unseeded /
 /// unparsable. Shared by the admission-floor and readiness-gate hooks.
@@ -160,6 +215,21 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Keep a model's prompt cache across an unload (factory `true`): pass
+  /// `--slot-save-path` on launches, save idle slots before an eviction
+  /// (idle sweep / make-room) stop, and restore the files when the model
+  /// launches again. Needs a `llama-server` build advertising
+  /// `--slot-save-path`; builds without it launch unchanged.
+  #[serde(default = "default_true")]
+  pub slot_cache: bool,
+  /// Per-model cap on slot save files, in MiB. The largest files go first
+  /// (oldest mtime). Default [`DEFAULT_SLOT_CACHE_MAX_MB`].
+  #[serde(default = "default_slot_cache_max_mb")]
+  pub slot_cache_max_mb: u64,
+  /// Slot save files older than this many days are dropped on the next save
+  /// or restore pass. Default [`DEFAULT_SLOT_CACHE_TTL_DAYS`].
+  #[serde(default = "default_slot_cache_ttl_days")]
+  pub slot_cache_ttl_days: u64,
 }
 
 fn default_true() -> bool {
@@ -170,6 +240,14 @@ fn default_fit_ctx_floor() -> u32 {
   crate::config::DEFAULT_FIT_CTX_FLOOR
 }
 
+fn default_slot_cache_max_mb() -> u64 {
+  DEFAULT_SLOT_CACHE_MAX_MB
+}
+
+fn default_slot_cache_ttl_days() -> u64 {
+  DEFAULT_SLOT_CACHE_TTL_DAYS
+}
+
 impl Default for LlamaCppConfig {
   fn default() -> Self {
     Self {
@@ -178,6 +256,9 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      slot_cache: true,
+      slot_cache_max_mb: DEFAULT_SLOT_CACHE_MAX_MB,
+      slot_cache_ttl_days: DEFAULT_SLOT_CACHE_TTL_DAYS,
     }
   }
 }
@@ -374,16 +455,24 @@ impl Backend for LlamaCppBackend {
   }
 
   fn probe_caps(&self, binary: &Path) -> std::collections::BTreeMap<String, String> {
+    // One `--help` probe per binary answers every "does this build accept
+    // flag X" question; readers degrade conservatively on an empty reply.
+    let help = caps::help_text(binary);
     let mut caps = std::collections::BTreeMap::new();
     caps.insert(
       CAP_LOAD_MODE_DIALECT.to_string(),
-      caps::LoadModeDialect::probe(binary).label().to_string(),
+      caps::LoadModeDialect::from_help(&help).label().to_string(),
+    );
+    caps.insert(
+      CAP_SLOT_SAVE.to_string(),
+      caps::help_supports_slot_save(&help).to_string(),
     );
     caps
   }
 
   fn seed_binary_caps(&self, binary: &Path, servers: &[super::Server], params: &mut LaunchParams) {
-    let dialect = match servers.iter().find(|s| s.binary == binary) {
+    let server = servers.iter().find(|s| s.binary == binary);
+    let dialect = match server {
       Some(server) => caps::LoadModeDialect::from_label(
         server.caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str),
       ),
@@ -403,6 +492,16 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_LOAD_MODE_DIALECT.to_string(),
       dialect.label().to_string(),
     );
+    // Same shape for `--slot-save-path`: a catalog cap when there is one, a
+    // direct probe otherwise. `seed_launch_knobs` decided the feature is on;
+    // this is the per-binary veto.
+    let slot_save = match server.map(|s| s.caps.get(CAP_SLOT_SAVE)) {
+      Some(Some(v)) => v == "true",
+      _ => caps::help_supports_slot_save(&caps::help_text(binary)),
+    };
+    params
+      .launch_config
+      .insert(LLAMACPP_KNOB_SLOT_SAVE.to_string(), slot_save.to_string());
   }
 
   fn launch_priority(&self) -> i32 {
@@ -463,6 +562,37 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+    // Prompt-cache persistence across unloads: project the config decisions
+    // (on/off, per-model directory, cap, TTL) onto the launch. The per-binary
+    // veto (`slot_save_path`) lands later in `seed_binary_caps`; `compose`
+    // requires both. Fresh each launch like `jinja`, so a config flip cannot
+    // be shadowed by an inherited last_params value.
+    params.launch_config.remove(LLAMACPP_KNOB_SLOT_DIR);
+    params.launch_config.remove(LLAMACPP_KNOB_SLOT_MAX_BYTES);
+    params.launch_config.remove(LLAMACPP_KNOB_SLOT_TTL_SECS);
+    if cfg.slot_cache && !crate::launch::params::bench_disable_defaults_from_env() {
+      if let Some(state_dir) = ctx.state.state_dir() {
+        let dir = slot_cache::slot_dir_for(state_dir, &params.model_path);
+        // Creating it here keeps `prepare_launch` pure; a failure only costs
+        // the cache, and llama-server would fail the save just as loudly.
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+          log::warn!("slot-cache: cannot create {}: {e}", dir.display());
+        } else {
+          params.launch_config.insert(
+            LLAMACPP_KNOB_SLOT_DIR.to_string(),
+            dir.display().to_string(),
+          );
+          params.launch_config.insert(
+            LLAMACPP_KNOB_SLOT_MAX_BYTES.to_string(),
+            cfg.slot_cache_max_mb.saturating_mul(1 << 20).to_string(),
+          );
+          params.launch_config.insert(
+            LLAMACPP_KNOB_SLOT_TTL_SECS.to_string(),
+            (cfg.slot_cache_ttl_days.saturating_mul(86_400)).to_string(),
+          );
+        }
+      }
+    }
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {
@@ -501,6 +631,50 @@ impl Backend for LlamaCppBackend {
   ) -> crate::daemon::actuals::Actuals {
     // The llama-server-specific `/props` fetch + `n_ctx` parse.
     actuals::fetch_props_actuals(port, timeout).await
+  }
+
+  async fn before_ready(&self, port: u16, params: &LaunchParams) {
+    let Some(t) = slot_cache_tuning(params) else {
+      return;
+    };
+    // Bounded overall: a stalled restore delays Ready, and a proxy
+    // auto-start's client is waiting on it. A timeout is a cache miss.
+    let budget = std::time::Duration::from_secs(240);
+    match tokio::time::timeout(
+      budget,
+      slot_cache::restore_prompt_caches(port, &t.dir, t.ttl),
+    )
+    .await
+    {
+      Ok(0) => {}
+      Ok(n) => log::info!("slot-cache: restored {n} slot(s) on port {port}"),
+      Err(_) => {
+        log::warn!("slot-cache: restore on port {port} exceeded {budget:?}; continuing cold")
+      }
+    }
+  }
+
+  async fn before_evict_stop(&self, model: &crate::daemon::supervisor::ManagedModel) {
+    let params = model.params();
+    let Some(t) = slot_cache_tuning(params) else {
+      return;
+    };
+    // Bounded overall: eviction must not stall behind a slow disk; on
+    // timeout the stop proceeds and this launch simply caches nothing.
+    let budget = std::time::Duration::from_secs(120);
+    match tokio::time::timeout(
+      budget,
+      slot_cache::save_prompt_caches(model.port(), &t.dir, t.max_bytes, t.ttl),
+    )
+    .await
+    {
+      Ok(0) => {}
+      Ok(n) => log::info!("slot-cache: saved {n} slot(s) before evicting this launch"),
+      Err(_) => log::warn!(
+        "slot-cache: save on port {} exceeded {budget:?}; stopping without saving",
+        model.port()
+      ),
+    }
   }
 
   fn gpu_resident(&self, params: &LaunchParams, layer_count: Option<u64>) -> bool {
@@ -570,6 +744,62 @@ mod tests {
   use super::*;
   use crate::launch::mode::LaunchMode;
   use std::ffi::OsString;
+
+  fn slot_params(pairs: &[(&str, &str)]) -> LaunchParams {
+    let mut p = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
+    for (k, v) in pairs {
+      p.launch_config.insert(k.to_string(), v.to_string());
+    }
+    p
+  }
+
+  #[test]
+  fn slot_tuning_needs_the_veto_and_the_dir_and_falls_back_to_factory_cap() {
+    // Missing veto, veto off, or missing dir → no tuning.
+    for pairs in [
+      &[(LLAMACPP_KNOB_SLOT_DIR, "/state/slot-cache/x")][..],
+      &[
+        (LLAMACPP_KNOB_SLOT_SAVE, "false"),
+        (LLAMACPP_KNOB_SLOT_DIR, "/state/slot-cache/x"),
+      ][..],
+      &[(LLAMACPP_KNOB_SLOT_SAVE, "true")][..],
+    ] {
+      assert!(
+        slot_cache_tuning(&slot_params(pairs)).is_none(),
+        "{pairs:?}"
+      );
+    }
+    let t = slot_cache_tuning(&slot_params(&[
+      (LLAMACPP_KNOB_SLOT_SAVE, "true"),
+      (LLAMACPP_KNOB_SLOT_DIR, "/state/slot-cache/x"),
+    ]))
+    .expect("veto + dir yields tuning");
+    assert_eq!(t.dir, PathBuf::from("/state/slot-cache/x"));
+    assert_eq!(t.max_bytes, DEFAULT_SLOT_CACHE_MAX_MB * (1 << 20));
+    assert_eq!(t.ttl.as_secs(), DEFAULT_SLOT_CACHE_TTL_DAYS * 86_400);
+    let tuned = slot_cache_tuning(&slot_params(&[
+      (LLAMACPP_KNOB_SLOT_SAVE, "true"),
+      (LLAMACPP_KNOB_SLOT_DIR, "/d"),
+      (LLAMACPP_KNOB_SLOT_MAX_BYTES, "123"),
+      (LLAMACPP_KNOB_SLOT_TTL_SECS, "45"),
+    ]))
+    .unwrap();
+    assert_eq!((tuned.max_bytes, tuned.ttl.as_secs()), (123, 45));
+  }
+
+  #[test]
+  fn slot_dir_is_hashed_and_stable() {
+    let a = slot_cache::slot_dir_for(Path::new("/state"), Path::new("/models/m.gguf"));
+    assert_eq!(
+      a,
+      slot_cache::slot_dir_for(Path::new("/state"), Path::new("/models/m.gguf"))
+    );
+    assert_ne!(
+      a,
+      slot_cache::slot_dir_for(Path::new("/state"), Path::new("/models/other.gguf"))
+    );
+    assert!(a.starts_with("/state/slot-cache/"));
+  }
 
   #[test]
   fn anthropic_effort_mapping_is_switchable_off() {

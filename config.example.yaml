@@ -545,6 +545,33 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     map_anthropic_effort: true
 
+    # Keep a model's prompt cache across an unload (default: true). When the
+    # idle sweep or make-room evicts a launch mid-conversation, its idle
+    # slots' KV caches are saved to disk before the stop (`--slot-save-path`
+    # + `POST /slots/{id}?action=save`), and the next launch of the same
+    # model restores them before it takes traffic — the follow-up request
+    # skips reprocessing the whole prompt. Manual `stop` and daemon shutdown
+    # never save: only eviction paths do, so a deliberate stop stays instant.
+    # Files live under `<state-dir>/slot-cache/<model-hash>/` and hold the
+    # full conversation prompt — same privacy class as `state.json`. Builds
+    # without `--slot-save-path` (older forks) launch unchanged.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    slot_cache: true
+
+    # Per-model cap on those save files, in MiB (default: 4096). A save file
+    # is roughly 32 KB per cached token for a GQA model, so a 100k-token slot
+    # is about 3.3 GB. Over the cap, the files with the oldest mtimes go.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    slot_cache_max_mb: 4096
+
+    # Save files older than this many days are dropped on the next save or
+    # restore pass (default: 14).
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    slot_cache_ttl_days: 14
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend
