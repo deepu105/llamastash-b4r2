@@ -25,6 +25,7 @@
 
 use std::ffi::OsString;
 
+use super::prompt_cache;
 use crate::launch::mode::LaunchMode;
 use crate::launch::params::LaunchParams;
 
@@ -109,6 +110,18 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
   {
     argv.push("--fit-ctx".into());
     argv.push(floor.to_string().into());
+  }
+  // Prompt cache across an unload: llama.cpp only reads a slot KV file that
+  // lives under `--slot-save-path`, so the flag is what makes a save possible.
+  // Emitted only when the backend seeded a directory it actually created (the
+  // feature is config-gated, and a missing directory makes llama.cpp refuse to
+  // start). Bench parity suppresses it, same as `--jinja`.
+  if let Some(dir) = params
+    .launch_config
+    .get(prompt_cache::KNOB_PROMPT_CACHE_DIR)
+  {
+    argv.push("--slot-save-path".into());
+    argv.push(dir.clone().into());
   }
   // Emit the device selector verbatim — exactly once. Empty / unset
   // means "let llama-server auto-select" (no flag).
@@ -195,6 +208,31 @@ mod tests {
 
   fn base_params() -> LaunchParams {
     LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat)
+  }
+
+  /// The prompt-cache directory arrives on `launch_config` from
+  /// `seed_launch_knobs`; its presence is what puts `--slot-save-path` on the
+  /// command line, because llama.cpp refuses to start with a path that is not a
+  /// directory.
+  #[test]
+  fn a_prompt_cache_dir_emits_slot_save_path() {
+    let mut p = base_params();
+    p.launch_config.insert(
+      super::super::prompt_cache::KNOB_PROMPT_CACHE_DIR.to_string(),
+      "/cache/prompt-cache".to_string(),
+    );
+    let argv = strs(&compose(&p, 41100));
+    let at = argv
+      .iter()
+      .position(|a| a == "--slot-save-path")
+      .expect("the flag is emitted");
+    assert_eq!(argv[at + 1], "/cache/prompt-cache");
+    assert!(
+      !strs(&compose(&base_params(), 41100))
+        .iter()
+        .any(|a| a == "--slot-save-path"),
+      "no directory seeded, no flag"
+    );
   }
 
   fn with_load_mode(mode: &str, dialect: &str) -> Vec<String> {

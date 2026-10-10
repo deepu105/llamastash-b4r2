@@ -545,6 +545,36 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     map_anthropic_effort: true
 
+    # Keep a launch's prompt cache when the proxy unloads it (default: true).
+    # When the idle sweep or make-room stops a llama.cpp launch mid-conversation,
+    # each idle slot's KV cache is written to
+    # `<cache dir>/prompt-cache/` first (llama.cpp's `--slot-save-path` +
+    # `POST /slots/{id}?action=save`), and the next launch of that model reads it
+    # back before it takes any traffic. The returning request then continues the
+    # conversation instead of reprocessing the whole prompt — at 100k tokens on a
+    # small CPU model that is about 50 minutes of prefill replaced by 1.4 s of
+    # disk I/O (see docs/spikes/2026-10-10-prompt-cache-across-unload.md).
+    # A manual `llamastash stop` saves nothing: that is you saying you are done.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    prompt_cache: true
+
+    # Ceiling on the total size of those saved caches, in MiB (default: 16384).
+    # KV is about 32 KB per token on a 1B-class model and grows with depth and KV
+    # heads, so a 100k-token prompt is 3 GiB there and several times that on a
+    # 30B+. Past the cap the oldest saved slots go first. `0` is treated as the
+    # factory value (a cap of 0 would keep nothing).
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    prompt_cache_max_mb: 16384
+
+    # How many days a saved cache is kept for a conversation nobody returned to
+    # (default: 7). Expired files are dropped when a launch is prepared or a save
+    # runs. `0` keeps them until the size cap above evicts them.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    prompt_cache_ttl_days: 7
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend

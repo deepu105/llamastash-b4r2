@@ -82,6 +82,9 @@ backend: # Per-engine config, one block per backend. llama.cpp is the
     strict_fit: false # Refuse (vs degrade) an unplaceable --fit. Env: LLAMASTASH_STRICT_FIT.
     jinja: true # Emit --jinja every launch (tool calling). Config-only.
     map_anthropic_effort: true # Map Anthropic output_config.effort to the engine kwarg. Config-only.
+    prompt_cache: true # Keep a prompt cache when the proxy unloads a launch. Config-only.
+    prompt_cache_max_mb: 16384 # Ceiling on those saved caches; oldest go first. Config-only.
+    prompt_cache_ttl_days: 7 # Drop a saved cache nobody returned to after N days (0 = never). Config-only.
   lemonade:
     # servers: [{ binary: /opt/lemonade/lemond }] # lemond path; else PATH.
     # enabled: # tri-state: unset=auto, true=force on, false=force off.
@@ -616,7 +619,7 @@ Beside its launch settings an entry can pin how long it stays loaded and whether
 - `idle_ttl_secs: 0` — never unload this preset's launches. Note the sweep only ever considers **proxy auto-started** launches: anything you `llamastash start` (or the TUI launches) is exempt from eviction whatever its preset says, so a TTL is about models the proxy brought up on a request.
 - `preload: true` — start this preset when the daemon boots. Same as naming it in `daemon.preload`, and the same exemption applies: a preloaded launch is manual intent, so it stays up until you stop it. The preset's key has to name **one** model: a preloaded launch can never be unloaded, so an arch or wide-glob key (which would pin every model it matches) is skipped at boot with a line in the daemon log — name the model, or list them under `daemon.preload` in the order you want them.
 
-A re-save that says nothing about residency keeps whatever the name already pins, even when the save lands under the model's own key and shadows an arch or glob entry of the same name; `--no-idle-ttl` / `--no-preload` are the only way to drop a pin. The one exception is `preload`: a family key's `preload: true` is not carried onto a single-model key, because boot refuses to preload a family and a preloaded launch can never be unloaded — so a `Ctrl+P` recapture cannot start loading your model at boot behind your back. The sweep reads the TTL from the daemon's live preset store on every pass, so `presets save --idle-ttl` moves a running launch's deadline without a relaunch; a hand edit to `config.yaml` needs `daemon restart`, like any other hand edit. When a request cannot be admitted because the host is full, the daemon first tries to make room by unloading idle auto-started launches, least-recently-used first (see §Proxy); launches pinned to `idle_ttl_secs: 0`, launches with a request in flight, and manual or preloaded launches are never picked.
+A re-save that says nothing about residency keeps whatever the name already pins, even when the save lands under the model's own key and shadows an arch or glob entry of the same name; `--no-idle-ttl` / `--no-preload` are the only way to drop a pin. The one exception is `preload`: a family key's `preload: true` is not carried onto a single-model key, because boot refuses to preload a family and a preloaded launch can never be unloaded — so a `Ctrl+P` recapture cannot start loading your model at boot behind your back. The sweep reads the TTL from the daemon's live preset store on every pass, so `presets save --idle-ttl` moves a running launch's deadline without a relaunch; a hand edit to `config.yaml` needs `daemon restart`, like any other hand edit. When a request cannot be admitted because the host is full, the daemon first tries to make room by unloading idle auto-started launches, least-recently-used first (see §Proxy); launches pinned to `idle_ttl_secs: 0`, launches with a request in flight, and manual or preloaded launches are never picked. A llama.cpp launch that one of those passes unloads keeps its prompt cache on disk and gets it back on the next launch, so the conversation continues instead of reprocessing ([§ Prompt cache across an unload](#prompt-cache-across-an-unload)).
 
 ### `llamastash favorites`
 
@@ -1413,6 +1416,19 @@ llamastash status --json | jq .proxy
 The block also carries `request_log_file`. It is `null` unless [`proxy.request_log_file`](#llamastash-requests-model-ref) is on; then it is `{ "path": "<log dir>/requests.jsonl", "dropped": 0 }`, where `dropped` counts the finished requests that did not reach the file. A `dropped` that keeps growing means the file could not be opened or written; the daemon log has the reason, logged once.
 
 The same block is on the IPC `status` method response. The TUI's Daemon info pane shows the proxy state on row 3 as `proxy <status> <addr>` (an authed LAN listener adds `(auth)`); a toast fires on the transition into `port_in_use` or `refused_insecure`. `proxy.enabled: false` renders the row as `proxy disabled`.
+
+### Prompt cache across an unload
+
+When the proxy unloads a model — the idle TTL sweep (`proxy.idle_ttl_secs`, or a preset's own `idle_ttl_secs`) or a make-room pass that needed the memory for something else — the next request for it starts the server again and, without help, reprocesses the whole conversation. llama.cpp can write a slot's KV cache to disk and read it back, so llamastash does that on your behalf (llama.cpp launches only):
+
+- **Saving** happens just before an *eviction* stop: every idle slot's cache goes to `<cache dir>/prompt-cache/`. A request that was still generating is not touched, and a launch the sweep skips saves nothing. `llamastash stop` saves nothing either — that is you ending the conversation.
+- **Restoring** happens when the model comes back up, before it takes any request, so the follow-up you send after the gap finds its prompt already in the cache. Measured end to end on a 1B CPU launch with a 4 212-token conversation: the follow-up after an idle-TTL eviction took 1.65 s with the cache and 14.15 s without it. What you see is a first token that arrives seconds later than the cold case instead of minutes: the response reports the reused prefix as `usage.prompt_tokens_details.cached_tokens` (and `timings.cache_n`).
+- Nothing matches on conversation ids. A saved cache belongs to the model file it was written for, and llama.cpp itself decides whether a returning request matches the cached prefix. A changed model file, a different context window, or an unrelated prompt therefore costs nothing but the disk space.
+- Files are bounded: `backend.llamacpp.prompt_cache_max_mb` (total, oldest evicted first) and `backend.llamacpp.prompt_cache_ttl_days`. The whole feature is `backend.llamacpp.prompt_cache: false` if you would rather not keep prompt data on disk at all — worth knowing that the file is the KV of your own conversation, in your own cache directory.
+
+Sizing: KV is 32 784 bytes per token on a 1B-class model (16 layers x 8 KV heads x 64 dims x 2 bytes x K and V, plus the slot index) and grows with depth and width, so a 100k-token prompt was 3.05 GiB on the model in [`spikes/2026-10-10-prompt-cache-across-unload.md`](spikes/2026-10-10-prompt-cache-across-unload.md) — where 2 979 s of reprocessing became 1.42 s of save plus restore. If one conversation's cache is bigger than the whole cap it is dropped, with a line in the daemon log saying so.
+
+The daemon logs both sides at `info`: `prompt cache: saved N idle slot(s) …` when a launch is unloaded and `prompt cache: restored N slot(s) …` when it comes back.
 
 ### Endpoints
 

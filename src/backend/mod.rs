@@ -424,6 +424,33 @@ pub trait Backend {
     crate::daemon::actuals::Actuals::default()
   }
 
+  /// Give a launch the chance to write down what it can carry across a stop,
+  /// immediately **before** the proxy's eviction paths (idle sweep, make-room)
+  /// stop it. Default no-op: only an engine with a way to park live session state
+  /// has anything to do here. llama.cpp writes each idle slot's KV cache out so
+  /// the next launch of that model starts warm instead of reprocessing the
+  /// prompt.
+  ///
+  /// Called on eviction only: a manual `stop` is the user saying they are done
+  /// with the launch. Best-effort by contract — an implementation must never
+  /// propagate a failure, because the caller is mid-stop.
+  async fn preserve_prompt_cache(
+    &self,
+    _ctx: &MethodContext,
+    _model: &crate::daemon::supervisor::ManagedModel,
+  ) {
+  }
+
+  /// Read back whatever [`preserve_prompt_cache`](Backend::preserve_prompt_cache)
+  /// parked for this launch identity. Called once per launch, after its health
+  /// probe passes and **before** it is declared Ready, so the first request that
+  /// arrives finds the state in place rather than racing it. Default no-op.
+  ///
+  /// Takes no [`MethodContext`] on purpose: the supervisor calls it with the
+  /// launch alone, and a backend that needs its own config projects it onto
+  /// `LaunchParams::launch_config` at launch time.
+  async fn restore_prompt_cache(&self, _model: &crate::daemon::supervisor::ManagedModel) {}
+
   /// Whether `extras` already configures speculative decoding by hand, in which
   /// case llamastash defers entirely and adds none of its own (KD3).
   ///
@@ -1171,6 +1198,18 @@ impl Backend for Backends {
     timeout: std::time::Duration,
   ) -> crate::daemon::actuals::Actuals {
     for_each_backend!(self, b => b.fetch_actuals(port, timeout).await)
+  }
+
+  async fn preserve_prompt_cache(
+    &self,
+    ctx: &MethodContext,
+    model: &crate::daemon::supervisor::ManagedModel,
+  ) {
+    for_each_backend!(self, b => b.preserve_prompt_cache(ctx, model).await)
+  }
+
+  async fn restore_prompt_cache(&self, model: &crate::daemon::supervisor::ManagedModel) {
+    for_each_backend!(self, b => b.restore_prompt_cache(model).await)
   }
 
   fn speculation_set_in_extras(&self, extras: &[OsString]) -> bool {
