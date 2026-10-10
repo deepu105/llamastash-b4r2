@@ -248,6 +248,20 @@ Or run the file on ds4 instead, through a [generic server entry](usage.md#runnin
 
 **Fix:** the row stays until you stop it: `llamastash stop <model>` (or the stop key in the TUI, `Ctrl+s` by default). A new request to the proxy starts a fresh copy either way.
 
+## A reloaded model still reprocesses the whole prompt
+
+The prompt cache is kept across an unload only when the idle sweep or make-room stopped the model (not `stop`, `daemon stop` or a crash), and only for a llama.cpp chat launch without speculative decoding. Look for the two `slot save:` lines in `llamastash.log` under the log directory:
+
+- No `saved` line at the unload: the slot was empty, the save was estimated over `backend.llamacpp.slot_save.max_gib` or over the free disk space, or the launch is one of the kinds left out. The line says which when it was refused.
+- `saved` but no `restored`: the next launch had different settings (context size, cache type, extras), the model file changed, or the save was older than `max_age_hours`.
+- `not restored: HTTP 400`: llama-server refused the file, usually because `--fit` gave this launch a smaller context than the saved prompt needs. The file is deleted and the prompt is reprocessed once.
+
+See `docs/usage.md` § Prompt cache across an unload.
+
+## `slots/` in the cache directory is using a lot of disk
+
+Those are saved prompt caches. One is the KV cache for the tokens it holds: 3 GiB for 100k tokens on a 1B model, and several times that on a larger model. All of them together stay under `backend.llamacpp.slot_save.max_gib` (default 32) and each is deleted after `max_age_hours` (default 24) or once restored. Lower the cap, point `slot_save.dir` at another disk, or set `enabled: false`, which deletes the files at the next daemon start. Deleting the directory by hand is safe.
+
 ## `launch refused: needs N GiB but only M is free`
 
 **Symptom:** `start` exits before spawning anything, naming the projected demand and the effective free memory.

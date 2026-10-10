@@ -675,6 +675,14 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
           }
         }
         *probe_model.inner.actuals.write().await = actuals;
+        // Before Ready, so the request that started this launch finds whatever
+        // the backend brings back from the last run. Skipped when a stop
+        // arrived during the load.
+        if matches!(probe_model.state().await, ManagedState::Loading) {
+          probe_backend
+            .after_ready(&probe_model.inner.params, probe_model.inner.port)
+            .await;
+        }
         let secs = SystemTime::now()
           .duration_since(UNIX_EPOCH)
           .map(|d| d.as_secs())

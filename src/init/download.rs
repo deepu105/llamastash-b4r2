@@ -528,8 +528,9 @@ pub fn precheck_disk(target_dir: &Path, needed_bytes: u64) -> Result<(), Downloa
   Ok(())
 }
 
+/// Bytes free to the caller on the filesystem holding `path`.
 #[cfg(unix)]
-fn available_bytes(path: &Path) -> Option<u64> {
+pub(crate) fn available_bytes(path: &Path) -> Option<u64> {
   use std::ffi::CString;
   use std::os::unix::ffi::OsStrExt;
   let cstr = CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -542,7 +543,7 @@ fn available_bytes(path: &Path) -> Option<u64> {
 }
 
 #[cfg(windows)]
-fn available_bytes(path: &Path) -> Option<u64> {
+pub(crate) fn available_bytes(path: &Path) -> Option<u64> {
   use std::os::windows::ffi::OsStrExt;
   use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
@@ -569,7 +570,7 @@ fn available_bytes(path: &Path) -> Option<u64> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn available_bytes(_path: &Path) -> Option<u64> {
+pub(crate) fn available_bytes(_path: &Path) -> Option<u64> {
   None
 }
 

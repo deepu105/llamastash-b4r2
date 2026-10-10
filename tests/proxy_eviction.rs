@@ -643,3 +643,307 @@ async fn make_room_skips_a_candidate_that_took_a_request() {
   let _ = busy.stop(Duration::from_secs(2)).await;
   std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Prompt cache kept across an eviction (`backend.llamacpp.slot_save`).
+// The fixture stands in for llama-server's slot endpoints; the real server is
+// covered by the end-to-end run recorded in the spike doc.
+// ---------------------------------------------------------------------------
+
+use llamastash::backend::Backend;
+
+/// A context with a cache directory, which is what switches slot saving on.
+/// Returned beside the proxy state because seeding a launch needs it.
+async fn build_slot_state(
+  registry: SupervisorRegistry,
+  dir: &Path,
+  persisted: PersistedState,
+) -> (Arc<ProxyState>, MethodContext) {
+  let log_dir = dir.join("logs");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let env = LaunchEnv {
+    binary: Some(fake_binary()),
+    port_range: allocate_port_range(),
+    log_dir,
+    probe: fast_probe(),
+    arch_defaults: BTreeMap::new(),
+    servers: Default::default(),
+    default_launch_mode: Default::default(),
+  };
+  let ctx = MethodContext::with_catalog(ShutdownToken::new(), ModelCatalog::new())
+    .with_supervisors(registry)
+    .with_state(persisted)
+    .with_launch_env(env)
+    .with_cache_dir(dir.to_path_buf());
+  (
+    ProxyState::from_context(&ctx, false, true, DEFAULT_BODY_LIMIT_BYTES),
+    ctx,
+  )
+}
+
+/// Launch params seeded the way `compose_and_spawn` seeds them, so the argv
+/// carries `--slot-save-path`.
+fn slot_params(ctx: &MethodContext, extras: &[&str]) -> LaunchParams {
+  let mut params = LaunchParams::new(PathBuf::from(MODEL_PATH), LaunchMode::Chat);
+  params.extras = extras.iter().map(std::ffi::OsString::from).collect();
+  LlamaCppBackend::new().seed_launch_knobs(ctx, &mut params);
+  params
+}
+
+async fn slot_launch(
+  dir: &Path,
+  registry: &SupervisorRegistry,
+  params: &LaunchParams,
+) -> ManagedModel {
+  let port = allocate_port();
+  let plan = LlamaCppBackend::new().process_spec(params, port, fake_binary(), fast_probe());
+  let model = supervisor_spawn(ManagedSpawn {
+    id: ModelId {
+      path: PathBuf::from(MODEL_PATH),
+      header_blake3: [0u8; 32],
+    },
+    params: params.clone(),
+    port,
+    mode: LaunchMode::Chat,
+    log_path: dir.join("logs").join("slot.log"),
+    plan,
+    origin: LaunchOrigin::AutoStart,
+    fit_gate: None,
+    resolved_backend: "llamacpp".to_string(),
+  })
+  .await
+  .expect("spawn");
+  wait_for_ready(&model).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+  model
+}
+
+/// One request straight to the fixture, returning the response body.
+async fn fixture_http(port: u16, method: &str, path: &str, body: &str) -> String {
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
+  let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+    .await
+    .expect("connect to the fixture");
+  let request = format!(
+    "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+    body.len()
+  );
+  sock.write_all(request.as_bytes()).await.unwrap();
+  let mut raw = String::new();
+  sock.read_to_string(&mut raw).await.unwrap();
+  raw
+    .split_once("\r\n\r\n")
+    .map(|(_, b)| b.to_string())
+    .unwrap_or_default()
+}
+
+/// Give the fixture's slot a prompt, the way a served request does.
+async fn serve_a_prompt(model: &ManagedModel) -> u64 {
+  let body = r#"{"messages":[{"role":"user","content":"a prompt worth keeping"}]}"#;
+  fixture_http(model.port(), "POST", "/v1/chat/completions", body).await;
+  body.len() as u64
+}
+
+async fn fixture_slot(model: &ManagedModel) -> serde_json::Value {
+  serde_json::from_str(&fixture_http(model.port(), "GET", "/fake/slot", "").await)
+    .expect("fixture slot json")
+}
+
+/// The files of the one save under `<dir>/slots/<model>/`.
+fn saved_files(dir: &Path) -> Vec<String> {
+  let mut out = Vec::new();
+  for model in std::fs::read_dir(dir.join("slots"))
+    .into_iter()
+    .flatten()
+    .flatten()
+  {
+    for file in std::fs::read_dir(model.path())
+      .into_iter()
+      .flatten()
+      .flatten()
+    {
+      out.push(file.file_name().to_string_lossy().into_owned());
+    }
+  }
+  out.sort();
+  out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_saves_the_slot_and_the_next_launch_restores_it() {
+  let dir = unique_temp("slot-sweep");
+  let registry = SupervisorRegistry::new();
+  let (state, ctx) = build_slot_state(
+    registry.clone(),
+    &dir,
+    PersistedState::new(DaemonState::default(), None),
+  )
+  .await;
+  let params = slot_params(&ctx, &[]);
+  let model = slot_launch(&dir, &registry, &params).await;
+  let tokens = serve_a_prompt(&model).await;
+  assert!(
+    saved_files(&dir).is_empty(),
+    "nothing is saved while it serves"
+  );
+
+  state.touch_mru(model.id()).await;
+  sleep(Duration::from_millis(5)).await;
+  eviction::sweep_once(&state, Duration::from_nanos(1)).await;
+  wait_until_not_ready(&model, "the idle launch").await;
+
+  let files = saved_files(&dir);
+  assert_eq!(files.len(), 2, "one slot file and its manifest: {files:?}");
+  assert!(
+    files[0].ends_with(".json") && files[1].ends_with(".slot0.bin"),
+    "{files:?}"
+  );
+
+  // The returning launch: same params, so the same fingerprint.
+  let again = slot_launch(&dir, &registry, &params).await;
+  assert_eq!(
+    fixture_slot(&again).await["tokens"],
+    tokens,
+    "the slot holds the saved prompt before the launch is reported Ready"
+  );
+  assert!(saved_files(&dir).is_empty(), "a restored save is deleted");
+  let _ = again.stop(Duration::from_secs(2)).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn make_room_saves_the_slots_of_what_it_unloads() {
+  let dir = unique_temp("slot-make-room");
+  let registry = SupervisorRegistry::new();
+  let persisted = PersistedState::new(DaemonState::default(), None);
+  let (state, ctx) = build_slot_state(registry.clone(), &dir, persisted.clone()).await;
+  let model = slot_launch(&dir, &registry, &slot_params(&ctx, &[])).await;
+  stamp_row(&persisted, &registry, &model, None, 500).await;
+  serve_a_prompt(&model).await;
+  state.touch_mru(model.id()).await;
+
+  let fits = eviction::make_room(
+    &state,
+    &Refusal {
+      demand_bytes: 400,
+      effective_free_bytes: 100,
+      reserved_bytes: 0,
+    },
+    |_| {},
+  )
+  .await;
+  assert!(fits);
+  wait_until_not_ready(&model, "the unloaded launch").await;
+  assert_eq!(saved_files(&dir).len(), 2, "{:?}", saved_files(&dir));
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A launch never used holds no prompt: the eviction goes ahead and writes
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unused_launch_is_evicted_without_a_save() {
+  let dir = unique_temp("slot-empty");
+  let registry = SupervisorRegistry::new();
+  let (state, ctx) = build_slot_state(
+    registry.clone(),
+    &dir,
+    PersistedState::new(DaemonState::default(), None),
+  )
+  .await;
+  let model = slot_launch(&dir, &registry, &slot_params(&ctx, &[])).await;
+  state.touch_mru(model.id()).await;
+  sleep(Duration::from_millis(5)).await;
+  eviction::sweep_once(&state, Duration::from_nanos(1)).await;
+  wait_until_not_ready(&model, "the unused launch").await;
+  assert!(saved_files(&dir).is_empty());
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Poll the fixture until `field` of `/fake/slot` equals `want`.
+async fn wait_for_slot(model: &ManagedModel, field: &str, want: serde_json::Value) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  while fixture_slot(model).await[field] != want {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "fixture slot `{field}` never became {want}"
+    );
+    sleep(Duration::from_millis(10)).await;
+  }
+}
+
+/// The launch serves while its slot is being saved. A request that arrives
+/// then must not be cut off by the stop that would have followed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_during_the_save_keeps_the_launch_running() {
+  let dir = unique_temp("slot-busy");
+  let registry = SupervisorRegistry::new();
+  let (state, ctx) = build_slot_state(
+    registry.clone(),
+    &dir,
+    PersistedState::new(DaemonState::default(), None),
+  )
+  .await;
+  let params = slot_params(&ctx, &["--fake-slot-save-delay-ms", "400"]);
+  let model = slot_launch(&dir, &registry, &params).await;
+  serve_a_prompt(&model).await;
+  state.touch_mru(model.id()).await;
+  sleep(Duration::from_millis(5)).await;
+
+  eviction::sweep_once(&state, Duration::from_nanos(1)).await;
+  wait_for_slot(&model, "saving", true.into()).await;
+  let guard = model.inflight_guard();
+  wait_for_slot(&model, "saves", 1.into()).await;
+  sleep(Duration::from_millis(150)).await;
+  assert!(
+    matches!(model.state().await, ManagedState::Ready),
+    "stopped under a request: {:?}",
+    model.state().await
+  );
+  drop(guard);
+  let _ = model.stop(Duration::from_secs(2)).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A save outlasts a sweep tick. The next pass must leave the launch to the
+/// eviction already working on it, not save and stop it a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_sweep_leaves_a_launch_that_is_still_saving() {
+  let dir = unique_temp("slot-claim");
+  let registry = SupervisorRegistry::new();
+  let (state, ctx) = build_slot_state(
+    registry.clone(),
+    &dir,
+    PersistedState::new(DaemonState::default(), None),
+  )
+  .await;
+  let params = slot_params(&ctx, &["--fake-slot-save-delay-ms", "400"]);
+  let model = slot_launch(&dir, &registry, &params).await;
+  serve_a_prompt(&model).await;
+  state.touch_mru(model.id()).await;
+  sleep(Duration::from_millis(5)).await;
+
+  eviction::sweep_once(&state, Duration::from_nanos(1)).await;
+  wait_for_slot(&model, "saving", true.into()).await;
+  eviction::sweep_once(&state, Duration::from_nanos(1)).await;
+  // Long enough for a second eviction, had one started, to be past its idle
+  // check and into its own save.
+  sleep(Duration::from_millis(100)).await;
+  // Held so the launch outlives both passes and the fixture can be asked how
+  // many saves it ran.
+  let guard = model.inflight_guard();
+  wait_for_slot(&model, "saves", 1.into()).await;
+  // A second save would have started at most 100 ms after the first.
+  sleep(Duration::from_millis(300)).await;
+  assert_eq!(
+    fixture_slot(&model).await["saves"],
+    1,
+    "the second pass saved the same launch again"
+  );
+  drop(guard);
+
+  // The claim is released with the eviction, so a later pass can evict it.
+  eviction::sweep_once(&state, Duration::from_nanos(1)).await;
+  wait_until_not_ready(&model, "the launch on a later pass").await;
+  assert_eq!(saved_files(&dir).len(), 2);
+  std::fs::remove_dir_all(&dir).ok();
+}

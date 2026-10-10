@@ -987,6 +987,34 @@ pub trait Backend {
       .await
   }
 
+  /// Called once a launch answers its readiness probe, **before** it is
+  /// reported Ready, so whatever this does is in place for the first request.
+  /// Default: nothing. A backend that keeps per-launch state on disk between
+  /// runs loads it here. Runs in the supervisor, which has the launch's params
+  /// and port but no daemon context; anything else the backend needs has to
+  /// ride on `params.launch_config`.
+  async fn after_ready(&self, _params: &LaunchParams, _port: u16) {}
+
+  /// Called before the idle sweep or make-room unloads `launch_id`, while it
+  /// is still serving. Default: nothing. A backend that can keep a launch's
+  /// state across the unload writes it out here.
+  ///
+  /// Not called for a manual stop, a daemon shutdown or a crash. The eviction
+  /// re-checks that the launch is still idle afterwards and may then leave it
+  /// running, so this must not change what the launch serves.
+  async fn before_evict(
+    &self,
+    _ctx: &MethodContext,
+    _launch_id: &crate::daemon::registry::LaunchId,
+  ) {
+  }
+
+  /// Clean up what this backend keeps on disk between runs. Called once per
+  /// backend at daemon boot, the one point a `config.yaml` change takes
+  /// effect. Must not block boot: do the work in a detached task. Default:
+  /// nothing.
+  fn boot_housekeeping(&self, _ctx: &MethodContext) {}
+
   /// Stop a launch this backend owns, returning the `{launch_id, state}` response
   /// (or a JSON-RPC error). **The backend owns the lifecycle**, mirroring
   /// [`start`](Backend::start): the default SIGTERMs the supervised child
@@ -1412,6 +1440,18 @@ impl Backend for Backends {
     exec: crate::daemon::launch_service::LaunchExec,
   ) -> Result<crate::daemon::launch_service::StartedLaunch, crate::ipc::protocol::ErrorObject> {
     for_each_backend!(self, b => b.start(ctx, exec).await)
+  }
+
+  async fn after_ready(&self, params: &LaunchParams, port: u16) {
+    for_each_backend!(self, b => b.after_ready(params, port).await)
+  }
+
+  async fn before_evict(&self, ctx: &MethodContext, launch_id: &crate::daemon::registry::LaunchId) {
+    for_each_backend!(self, b => b.before_evict(ctx, launch_id).await)
+  }
+
+  fn boot_housekeeping(&self, ctx: &MethodContext) {
+    for_each_backend!(self, b => b.boot_housekeeping(ctx))
   }
 
   async fn stop(

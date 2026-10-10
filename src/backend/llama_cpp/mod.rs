@@ -17,6 +17,7 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+pub mod slot_save;
 mod telemetry;
 
 use compose::compose;
@@ -160,6 +161,11 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Keep a launch's prompt cache across an idle-sweep or make-room unload:
+  /// save its slots to disk before the stop and restore them at the next
+  /// start. See [`slot_save`].
+  #[serde(default)]
+  pub slot_save: slot_save::SlotSaveConfig,
 }
 
 fn default_true() -> bool {
@@ -178,6 +184,7 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      slot_save: slot_save::SlotSaveConfig::default(),
     }
   }
 }
@@ -463,6 +470,26 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+    slot_save::seed(&cfg.slot_save, ctx.cache_dir.as_deref(), params);
+  }
+
+  async fn before_evict(&self, ctx: &MethodContext, launch_id: &crate::daemon::registry::LaunchId) {
+    let cfg = &ctx.backend.llamacpp.slot_save;
+    if !cfg.enabled {
+      return;
+    }
+    let Some(model) = ctx.supervisors.get(launch_id).await else {
+      return;
+    };
+    slot_save::save(cfg, model.params(), model.port()).await;
+  }
+
+  async fn after_ready(&self, params: &LaunchParams, port: u16) {
+    slot_save::restore(params, port).await;
+  }
+
+  fn boot_housekeeping(&self, ctx: &MethodContext) {
+    slot_save::prune_at_boot(&ctx.backend.llamacpp.slot_save, ctx.cache_dir.as_deref());
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {
@@ -595,6 +622,50 @@ mod tests {
       None,
       "off means the client's bytes go through untouched"
     );
+  }
+
+  #[test]
+  fn a_chat_launch_gets_a_slot_save_dir_only_when_the_daemon_has_a_cache_dir() {
+    let cache = crate::util::test_temp::unique_temp_dir("llamacpp-seed-slots");
+    let backend = LlamaCppBackend::new();
+    let seeded = |ctx: &MethodContext| {
+      let mut p = LaunchParams::new(PathBuf::from("/m/x.gguf"), LaunchMode::Chat);
+      backend.seed_launch_knobs(ctx, &mut p);
+      p
+    };
+    let bare =
+      crate::daemon::context::MethodContext::new(crate::daemon::shutdown::ShutdownToken::new());
+    assert!(
+      !seeded(&bare).launch_config.contains_key(slot_save::DIR_KEY),
+      "a context without a daemon writes nothing to disk"
+    );
+
+    let mut ctx = bare.clone().with_cache_dir(cache.clone());
+    let p = seeded(&ctx);
+    let dir = p
+      .launch_config
+      .get(slot_save::DIR_KEY)
+      .expect("seeded with a cache dir");
+    assert!(Path::new(dir).starts_with(cache.join("slots")));
+    let argv = compose(&p, 41100);
+    let at = argv
+      .iter()
+      .position(|a| a == "--slot-save-path")
+      .expect("the flag is what turns the slot calls on");
+    assert_eq!(argv[at + 1], dir.as_str());
+
+    ctx.backend.llamacpp.slot_save.enabled = false;
+    assert!(!seeded(&ctx).launch_config.contains_key(slot_save::DIR_KEY));
+    std::fs::remove_dir_all(&cache).ok();
+  }
+
+  #[tokio::test]
+  async fn before_evict_is_a_no_op_for_a_launch_it_cannot_find() {
+    let ctx =
+      crate::daemon::context::MethodContext::new(crate::daemon::shutdown::ShutdownToken::new());
+    LlamaCppBackend::new()
+      .before_evict(&ctx, &crate::daemon::registry::LaunchId::from_counter(7))
+      .await;
   }
 
   #[test]
