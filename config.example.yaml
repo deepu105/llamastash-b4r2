@@ -545,6 +545,40 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     map_anthropic_effort: true
 
+    # Keep a launched model's prompt cache across an unload (default: true).
+    # When the idle sweep or make-room stops a llama.cpp launch mid-conversation,
+    # each slot's cached prompt is written to disk first (`--slot-save-path` +
+    # `POST /slots/{id}?action=save`) and restored into the next launch of the
+    # same model, so a returning conversation resumes from the cache instead of
+    # reprocessing its whole prompt. A 100k-token prompt saves in about a second
+    # and restores in well under one — reprocessing the same prompt takes tens of
+    # seconds to minutes (numbers in docs/spikes/2026-10-10-prompt-cache-across-
+    # unload.md). Files hold prompt-derived data and live under the state dir
+    # (`slot-cache/`), mode 0600/0700. Saves only happen on eviction — an
+    # explicit `llamastash stop` ends the session intent and saves nothing.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    prompt_cache: true
+
+    # Total size cap across every saved prompt cache, as a suffixed byte count
+    # (`512M`, `16G`, or plain bytes). At eviction time the oldest entries past
+    # the cap are dropped; the entry just written is never dropped. Raise it if
+    # you keep long conversations to many models warm (one 100k-token slot costs
+    # roughly 3 GiB on an f16 cache).
+    #
+    # Default: 16G.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    prompt_cache_max_bytes: 16G
+
+    # How many days a saved prompt cache may go unused before it is pruned.
+    # `0` disables age pruning; the size cap still applies.
+    #
+    # Default: 7.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    prompt_cache_max_age_days: 7
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend

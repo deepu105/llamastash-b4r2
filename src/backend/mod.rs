@@ -1002,6 +1002,20 @@ pub trait Backend {
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     crate::daemon::launch_service::stop_supervised(ctx, launch_id, grace_secs).await
   }
+
+  /// Persist warm per-session state while an **evicted** launch is still up. The
+  /// idle sweep and make-room call this on a Ready, zero-in-flight launch
+  /// immediately before its stop, so a returning conversation can resume without
+  /// reprocessing. Never called on an explicit stop: a stop the user asked for
+  /// ends the session intent too. Defaults to no-op, so eviction stays
+  /// backend-neutral.
+  async fn before_eviction_stop(&self, _port: u16, _params: &LaunchParams) {}
+
+  /// Warm persisted state into a launch whose engine just became reachable,
+  /// immediately before the launch is declared Ready so no request can race the
+  /// warm-up. Backends must swallow their own errors: a failed warm-up may cost
+  /// the benefit it exists for, never the launch. Defaults to no-op.
+  async fn after_launch_ready(&self, _port: u16, _params: &LaunchParams) {}
 }
 
 // ============================================================================
@@ -1421,6 +1435,14 @@ impl Backend for Backends {
     grace_secs: u64,
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     for_each_backend!(self, b => b.stop(ctx, launch_id, grace_secs).await)
+  }
+
+  async fn before_eviction_stop(&self, port: u16, params: &LaunchParams) {
+    for_each_backend!(self, b => b.before_eviction_stop(port, params).await)
+  }
+
+  async fn after_launch_ready(&self, port: u16, params: &LaunchParams) {
+    for_each_backend!(self, b => b.after_launch_ready(port, params).await)
   }
 }
 

@@ -675,6 +675,13 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
           }
         }
         *probe_model.inner.actuals.write().await = actuals;
+        // Warm any persisted per-session state into the live engine before
+        // declaring Ready, so no request can arrive against the launch while it
+        // is still loading its cache in (llama.cpp slot restore). The hook
+        // swallows its own errors; a launch never fails on a missed warm-up.
+        probe_backend
+          .after_launch_ready(probe_model.inner.port, probe_model.params())
+          .await;
         let secs = SystemTime::now()
           .duration_since(UNIX_EPOCH)
           .map(|d| d.as_secs())

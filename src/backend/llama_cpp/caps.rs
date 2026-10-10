@@ -42,25 +42,11 @@ impl LoadModeDialect {
   /// itself will reject the argv with a message naming the flag. Guessing
   /// `Enum` there would turn a clear rejection into a confusing one.
   pub fn probe(binary: &Path) -> Self {
-    let mut cmd = Command::new(binary);
-    // The unified app takes server flags behind `serve`; `llama --help` prints
-    // the dispatcher's own help, which lists no server flags at all.
-    cmd.args(super::serve_prefix(binary));
-    cmd.arg("--help");
-    match crate::util::process::run_with_drain_and_timeout(cmd, HELP_TIMEOUT) {
-      Ok(out) => {
-        // Some builds print help on stderr, some on stdout; read both rather
-        // than depending on which.
-        let text = format!(
-          "{}{}",
-          String::from_utf8_lossy(&out.stdout),
-          String::from_utf8_lossy(&out.stderr)
-        );
-        Self::from_help(&text)
-      }
-      Err(e) => {
+    match server_help(binary) {
+      Some(text) => Self::from_help(&text),
+      None => {
         log::warn!(
-          "`{} --help` failed: {e:?}; assuming the pre-`--load-mode` flags",
+          "`{} --help` failed; assuming the pre-`--load-mode` flags",
           binary.display()
         );
         Self::Flags
@@ -95,6 +81,39 @@ impl LoadModeDialect {
       _ => Self::Flags,
     }
   }
+}
+
+/// One binary's whole server `--help` text, or `None` when it will not answer.
+/// Shared by every flag probe so a boot probe costs one subprocess per binary.
+/// The unified app takes server flags behind `serve`; `llama --help` prints the
+/// dispatcher's own help, which lists no server flags at all.
+pub fn server_help(binary: &Path) -> Option<String> {
+  let mut cmd = Command::new(binary);
+  cmd.args(super::serve_prefix(binary));
+  cmd.arg("--help");
+  match crate::util::process::run_with_drain_and_timeout(cmd, HELP_TIMEOUT) {
+    Ok(out) => {
+      // Some builds print help on stderr, some on stdout; read both rather
+      // than depending on which.
+      Some(format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+      ))
+    }
+    Err(e) => {
+      log::warn!("`{} --help` failed: {e:?}", binary.display());
+      None
+    }
+  }
+}
+
+/// Whether a build's help advertises `--slot-save-path`, the flag the prompt
+/// cache across an unload needs. A build that will not answer its help is read
+/// as unsupported: launching with an unknown flag fails the whole load, so only
+/// an advertised flag gets emitted.
+pub fn slot_save_supported_from_help(help: &str) -> bool {
+  help.contains("--slot-save-path")
 }
 
 #[cfg(test)]
@@ -133,6 +152,14 @@ mod tests {
   fn an_unreadable_help_falls_back_to_the_flags() {
     assert_eq!(LoadModeDialect::from_help(""), LoadModeDialect::Flags);
     assert_eq!(LoadModeDialect::default(), LoadModeDialect::Flags);
+  }
+
+  #[test]
+  fn slot_save_support_follows_the_flag_being_advertised() {
+    assert!(slot_save_supported_from_help(
+      "-sp, --slot-save-path PATH                   path to save slot kv cache (default: disabled)\n"
+    ));
+    assert!(!slot_save_supported_from_help(NEW_HELP));
   }
 
   #[test]
