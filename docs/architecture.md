@@ -176,6 +176,7 @@ A new backend is **one new module plus the minimum central wiring**; removing on
 | TUI display | generic id chip; the editor and the running knob view are both generated from `Backend::knobs()`; `DEFAULT_BACKEND_ID` / `default_backend` / `BackendChoice::from_id` cover the "default backend" and id→choice sites |
 | Non-replayable knobs | `KnobDef.volatile` marks a knob a backend treats as a here-and-now judgement rather than a preference; `knobs_for_persist` drops them (alongside the daemon's own `auto_set`) so a one-off `--preset` cannot silently become permanent |
 | Config-derived launch knobs | `seed_launch_knobs` projects a backend's own config into the generic `launch_config` map, read back only by that backend's `compose` / `admission_ctx_floor` / `readiness_fit_gate` — so no backend knob name rides the neutral launch IR |
+| Prompt cache across unloads | `seed_launch_cache` stamps a backend's per-model on-disk cache dir onto the launch params before argv composition; the eviction stop helper calls `before_stop` and the proxy auto-start path calls `after_ready` at Ready, before the first forward. All three default to no-op, so `make_room` / `sweep_once` / the launch path name no backend's cache — llama.cpp alone speaks slot save/restore |
 
 `BackendChoice` (`src/launch/params.rs`) is `Auto | Explicit(String)`, so a backend id is just data: `--backend <id>` validates against the registry (`cli_args::parse_backend_id`) and the wire form is the bare id string. Neutrality guards: `routed_backend_for` with a synthetic id, and `backends_forward_defaulted_methods_to_variants`.
 
@@ -378,6 +379,41 @@ A failed factor drops the entry from the running snapshot. Unmanaged `llama-serv
 **A confirmed entry is demoted, not restored.** `state.running` is cleared on every boot and each adopted snapshot is projected into an `external` row (`ExternalProcess::from_adopted`), because rebuilding a `ManagedModel` would mean re-attaching to a dead daemon's pipes — there is no way to resume log capture or the health monitor for a child this process never spawned. The consequences are deliberate: the row accepts `stop_external` and nothing else, it is **not** re-published on `/v1/models`, and `route::decide` cannot pick it, so the next proxy request for that model starts a new launch beside it. What does survive is the launch **name**, carried onto the row so `status` still renders `<model>@<name>` and `stop <name>` still reaches it — the one piece of the address a crash would otherwise take with it.
 
 **Nothing is re-launched at boot either — except what you ask for.** `daemon.preload:` (or a preset pinning `preload: true`) names the models that should be warm the moment the daemon is up, and `daemon::preload` starts them: each entry (a `list` reference, a `<model>@<preset>` address, or a launch file) goes through the normal `compose_and_spawn` with `LaunchOrigin::Manual`, so the admission gate prices it like any other launch and the idle sweep cannot unload it. Launches run sequentially in list order — two concurrent launches read the same free-memory sample and can both be admitted against memory only one fits in, which is what the gate exists to prevent — so the list doubles as a priority order. An entry that names nothing, or that does not fit, logs one line and is skipped: preload never blocks or fails the boot. A preset that pins `preload: true` has to be keyed to exactly one model, because a preloaded launch is manual intent and no sweep or make-room pass may ever take it back: an arch or wide-glob key would pin every model it matches and the boot would start them one after another until admission refused, so such a key is skipped with the count it scoped. Launch-file entries take `~` paths, expanded before the file is read. The daemon waits for the first discovery scan to populate the catalog before resolving references, since entries resolve the way CLI references do.
+
+### Prompt cache across unloads
+
+An idle-swept or make-room-evicted launch loses its KV cache, and the next
+request in that conversation reprocesses the whole prompt. llama.cpp can
+write a slot's prompt + KV to disk and read it back (`--slot-save-path` plus
+`POST /slots/{id}?action=save|restore`), and llamastash uses it for
+llama.cpp launches through three hooks, each a no-op for every other backend:
+
+- **Seed.** Every llama.cpp launch gets `<cache dir>/slot-cache/<model header
+  hash>/` stamped on its params by `Backend::seed_launch_cache` (the dir is
+  created there, because `llama-server` refuses a `--slot-save-path` that is
+  not an existing directory) and `compose` emits the flag. Re-derived per
+  launch, never inherited; `backend.llamacpp.prompt_cache_max_bytes: 0` or
+  bench parity drops it.
+- **Save (eviction only).** The sweeper and make-room stop through one helper
+  that calls `Backend::before_stop` before the backend's `stop`: llama.cpp
+  writes every slot holding a prompt to `slot-<id>.bin`, then enforces the
+  size cap — oldest files across all models are deleted first, and the model
+  being saved is never a victim of its own save. A manual stop, a restart,
+  and daemon shutdown save nothing: an eviction is the only event that means
+  "this conversation may come back".
+- **Restore (auto-start only).** When a proxy auto-start reaches `Ready`, the
+  proxy calls `Backend::after_ready` **before** forwarding the request that
+  started the launch; llama.cpp restores each saved file into the slot with
+  the same id. A restored slot prefix-matches incoming prompts, so the
+  returning conversation reprocesses only its new tail. A file that no
+  longer fits the new launch's context is logged and skipped (cold serve,
+  re-saved by the next eviction), and a file for a slot the new launch does
+  not have is left for a future launch that does.
+
+One cache costs ~32 KB per cached prompt token (f16 KV) — ~3 GiB for a
+100k-context conversation — hence the cap (factory 8 GiB). Measured
+save/restore/reprocess economics and the API surface:
+`docs/spikes/2026-10-10-prompt-cache-across-unload.md`.
 
 ## Daemon idle shutdown
 

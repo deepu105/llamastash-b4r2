@@ -1147,6 +1147,12 @@ pub(crate) async fn compose_and_spawn(
   let bypasses_admission = inference_backend.bypasses_admission(&launch_params);
   let force_admission = parsed.force;
 
+  // Seed backend-owned per-model on-disk cache state onto the params (llama.cpp
+  // stamps its prompt-cache slot-save dir; every other backend declares
+  // nothing). Re-derived, never inherited, so a value persisted in `last_params`
+  // cannot outlive the config flip that dropped it.
+  inference_backend.seed_launch_cache(ctx, &identity, &mut launch_params);
+
   // Hand the launch to the resolved backend: it decides *how* to start — a
   // supervised child process (the default `start`) or a delegation to its
   // managed-multiplexer umbrella — so this path never branches on lifecycle and

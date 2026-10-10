@@ -428,7 +428,7 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 4: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
-- [ ] Keep a model's prompt cache across an unload
+- [x] ~~Keep a model's prompt cache across an unload~~ — an eviction of a llama.cpp launch saves its slot KV caches to the cache dir and the next proxy auto-start restores them, so a returning conversation reprocesses only its new tail. Measured in `docs/spikes/2026-10-10-prompt-cache-across-unload.md`.
 - [ ] Warm the page cache before a load (`llamastash warm <model>`)
 
 ### Batch 5: CLI setup commands ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-5-cli-setup-commands))

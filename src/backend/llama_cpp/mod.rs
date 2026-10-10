@@ -17,6 +17,7 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+mod slot_cache;
 mod telemetry;
 
 use compose::compose;
@@ -49,6 +50,19 @@ pub const LLAMACPP_KNOB_FIT_CTX_FLOOR: &str = "fit_ctx_floor";
 pub const LLAMACPP_KNOB_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
 /// The same fact as a [`caps`] probe key on `Server::caps`.
 pub const CAP_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
+/// `launch_config` key carrying the per-model slot-save directory this
+/// launch runs `llama-server` with (`--slot-save-path`), the anchor of the
+/// prompt cache across unloads. Written by [`Backend::seed_launch_cache`],
+/// read by `compose` (argv) and by the before-stop/after-ready hooks.
+/// Absent when the cache is disabled (`prompt_cache_max_bytes: 0`), no cache
+/// dir resolves, or bench parity suppresses daemon defaults.
+pub const LLAMACPP_KNOB_SLOT_SAVE_PATH: &str = "slot_save_path";
+
+/// Budget for one slot save/restore HTTP call. The spike measured a 100k-context
+/// save at ~0.7-2.7 s and a restore at ~0.5-1.3 s on real hosts; llama.cpp
+/// defers a save on a slot that raced back into traffic, so the bound is well
+/// above the transfer, not near it.
+const SLOT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The `fit_ctx_floor` launch knob parsed to `u32`, or `None` when unseeded /
 /// unparsable. Shared by the admission-floor and readiness-gate hooks.
@@ -160,6 +174,15 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Total byte cap on the prompt caches kept across unloads (all models
+  /// together). An evicted llama.cpp launch's KV slot file costs ~32 KB per
+  /// cached prompt token (f16 KV), so a 100k-context conversation is ~3 GiB.
+  /// When a save would push the cache dir past this, the oldest files are
+  /// deleted first (other models before the one being saved). `0` disables
+  /// saving entirely — launches then run without `--slot-save-path`.
+  /// Factory [`crate::config::DEFAULT_PROMPT_CACHE_MAX_BYTES`].
+  #[serde(default = "default_prompt_cache_max_bytes")]
+  pub prompt_cache_max_bytes: u64,
 }
 
 fn default_true() -> bool {
@@ -170,6 +193,10 @@ fn default_fit_ctx_floor() -> u32 {
   crate::config::DEFAULT_FIT_CTX_FLOOR
 }
 
+fn default_prompt_cache_max_bytes() -> u64 {
+  crate::config::DEFAULT_PROMPT_CACHE_MAX_BYTES
+}
+
 impl Default for LlamaCppConfig {
   fn default() -> Self {
     Self {
@@ -178,6 +205,7 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      prompt_cache_max_bytes: crate::config::DEFAULT_PROMPT_CACHE_MAX_BYTES,
     }
   }
 }
@@ -210,6 +238,43 @@ impl LlamaCppBackend {
   pub fn new() -> Self {
     // llama.cpp honors the full typed-knob vocabulary.
     Self {}
+  }
+
+  /// The `seed_launch_cache` body with the config / env / cache-dir reads
+  /// already resolved to arguments — split out so tests drive every branch
+  /// without mutating the process environment (racy across the test threads).
+  fn seed_slot_cache(
+    identity: &ModelIdentity,
+    params: &mut LaunchParams,
+    enabled: bool,
+    bench_parity: bool,
+    cache_root: Option<PathBuf>,
+  ) {
+    // Re-derived every launch (like `seed_launch_knobs`): a value persisted in
+    // `last_params` must not outlive the config flip or bench-parity launch
+    // that should have dropped it.
+    params.launch_config.remove(LLAMACPP_KNOB_SLOT_SAVE_PATH);
+    if !enabled || bench_parity {
+      return;
+    }
+    let ModelIdentity::Gguf(id) = identity else {
+      return;
+    };
+    let Some(root) = cache_root else {
+      return;
+    };
+    let dir = slot_cache::model_cache_dir(&root, &id.header_hex());
+    // `llama-server` refuses to start with a `--slot-save-path` that is not a
+    // directory, so create it before the argv references it; a failure here
+    // drops the cache for this launch rather than failing the launch.
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+      log::warn!("prompt cache: cannot create {}: {e}", dir.display());
+      return;
+    }
+    params.launch_config.insert(
+      LLAMACPP_KNOB_SLOT_SAVE_PATH.to_string(),
+      dir.display().to_string(),
+    );
   }
 }
 
@@ -463,6 +528,110 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+  }
+
+  fn seed_launch_cache(
+    &self,
+    ctx: &MethodContext,
+    identity: &ModelIdentity,
+    params: &mut LaunchParams,
+  ) {
+    Self::seed_slot_cache(
+      identity,
+      params,
+      // A `0` cap means "never save", so nothing may be seeded.
+      ctx.backend.llamacpp.prompt_cache_max_bytes != 0,
+      // Bench parity: `scripts/bench` compares our argv byte-for-byte with
+      // raw `llama-server`, so no daemon default — cache dir included — rides.
+      crate::launch::params::bench_disable_defaults_from_env(),
+      slot_cache::cache_root(),
+    );
+  }
+
+  async fn before_stop(&self, ctx: &MethodContext, launch_id: &crate::daemon::registry::LaunchId) {
+    let Some(model) = ctx.supervisors.get(launch_id).await else {
+      return;
+    };
+    let Some(dir) = model
+      .params()
+      .launch_config
+      .get(LLAMACPP_KNOB_SLOT_SAVE_PATH)
+      .cloned()
+    else {
+      return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    match slot_cache::save_all(model.port(), SLOT_HTTP_TIMEOUT).await {
+      Ok((sum, failed)) if sum.slots_saved > 0 => log::info!(
+        "prompt cache: saved {} slot(s), {} tokens before evicting {}{} ({})",
+        sum.slots_saved,
+        sum.tokens,
+        launch_id.as_str(),
+        if failed > 0 {
+          format!(", {failed} failed")
+        } else {
+          String::new()
+        },
+        dir.display(),
+      ),
+      Ok((_, failed)) if failed > 0 => log::warn!(
+        "prompt cache: nothing saved before evicting {} ({failed} slot(s) failed)",
+        launch_id.as_str()
+      ),
+      Ok(_) => {
+        log::debug!(
+          "prompt cache: no prompt to save before evicting {}",
+          launch_id.as_str()
+        )
+      }
+      Err(e) => log::warn!(
+        "prompt cache: slot save before evicting {} failed: {e}",
+        launch_id.as_str()
+      ),
+    }
+    if let Some(root) = slot_cache::cache_root() {
+      let deleted = slot_cache::prune(&root, ctx.backend.llamacpp.prompt_cache_max_bytes, &dir);
+      if deleted > 0 {
+        log::info!("prompt cache: pruned {deleted} stale slot file(s) to fit the cap");
+      }
+    }
+  }
+
+  async fn after_ready(&self, ctx: &MethodContext, launch_id: &crate::daemon::registry::LaunchId) {
+    let Some(model) = ctx.supervisors.get(launch_id).await else {
+      return;
+    };
+    let Some(dir) = model
+      .params()
+      .launch_config
+      .get(LLAMACPP_KNOB_SLOT_SAVE_PATH)
+      .cloned()
+    else {
+      return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if !dir.is_dir() {
+      return;
+    }
+    match slot_cache::restore_all(model.port(), &dir, SLOT_HTTP_TIMEOUT).await {
+      Ok((sum, _)) if sum.slots_restored > 0 => log::info!(
+        "prompt cache: restored {} slot(s), {} tokens for {} ({})",
+        sum.slots_restored,
+        sum.tokens,
+        launch_id.as_str(),
+        dir.display(),
+      ),
+      Ok((_, 0)) => {}
+      Ok((_, failed)) => log::debug!(
+        "prompt cache: {} saved slot file(s) not restored for {} (serving cold)",
+        failed,
+        launch_id.as_str()
+      ),
+      Err(e) => log::warn!(
+        "prompt cache: slot restore for {} failed: {e}",
+        launch_id.as_str()
+      ),
+    }
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {
@@ -958,4 +1127,92 @@ mod tests {
   // parent module (`crate::backend`), where the enum now lives.
 
   // ---- config-derived launch knobs (jinja / strict_fit / fit_ctx_floor) ----
+
+  // ---- prompt cache across unloads (seed / compose / no-op guards) ----
+
+  fn gguf_identity(path: &str) -> ModelIdentity {
+    ModelIdentity::Gguf(crate::gguf::identity::compute(
+      std::path::PathBuf::from(path),
+      b"hdr",
+    ))
+  }
+
+  #[test]
+  fn seed_stamps_the_per_model_dir_and_creates_it() {
+    let root = std::env::temp_dir().join(format!("llamastash-seedtest-{}", std::process::id()));
+    let id = gguf_identity("/m/model.gguf");
+    let hex = id.as_gguf().unwrap().header_hex();
+    let mut p = LaunchParams::new(std::path::PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
+    // The root handed to the inner seed is the slot-cache root itself
+    // (`cache_root()` appends the subdir before this point).
+    LlamaCppBackend::seed_slot_cache(&id, &mut p, true, false, Some(root.clone()));
+    let want = root.join(&hex);
+    assert_eq!(
+      p.launch_config
+        .get(LLAMACPP_KNOB_SLOT_SAVE_PATH)
+        .map(String::as_str),
+      Some(want.display().to_string().as_str())
+    );
+    assert!(
+      want.is_dir(),
+      "the dir must exist before the argv references it"
+    );
+    std::fs::remove_dir_all(&root).ok();
+  }
+
+  #[test]
+  fn seed_replaces_a_stale_value_from_last_params() {
+    // The re-derive contract: a stale dir persisted in `last_params` must not
+    // outlive any of the flips that should have dropped it.
+    let id = gguf_identity("/m/model.gguf");
+    let mut p = LaunchParams::new(std::path::PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
+    p.launch_config.insert(
+      LLAMACPP_KNOB_SLOT_SAVE_PATH.to_string(),
+      "/old/dir".to_string(),
+    );
+    // cap 0 → disabled.
+    LlamaCppBackend::seed_slot_cache(&id, &mut p, false, false, None);
+    assert!(!p.launch_config.contains_key(LLAMACPP_KNOB_SLOT_SAVE_PATH));
+    // bench parity.
+    p.launch_config.insert(
+      LLAMACPP_KNOB_SLOT_SAVE_PATH.to_string(),
+      "/old/dir".to_string(),
+    );
+    LlamaCppBackend::seed_slot_cache(&id, &mut p, true, true, None);
+    assert!(!p.launch_config.contains_key(LLAMACPP_KNOB_SLOT_SAVE_PATH));
+    // no cache dir resolving.
+    p.launch_config.insert(
+      LLAMACPP_KNOB_SLOT_SAVE_PATH.to_string(),
+      "/old/dir".to_string(),
+    );
+    LlamaCppBackend::seed_slot_cache(&id, &mut p, true, false, None);
+    assert!(!p.launch_config.contains_key(LLAMACPP_KNOB_SLOT_SAVE_PATH));
+  }
+
+  #[tokio::test]
+  async fn eviction_hooks_are_inert_without_a_live_supervisor() {
+    // Both hooks are best-effort: a launch id the supervisor map does not know
+    // (already stopped, adopted, delegated) must return, not panic.
+    let ctx =
+      crate::daemon::context::MethodContext::new(crate::daemon::shutdown::ShutdownToken::new());
+    let b = LlamaCppBackend::new();
+    let ghost = crate::daemon::registry::LaunchId::from_counter(999);
+    b.before_stop(&ctx, &ghost).await;
+    b.after_ready(&ctx, &ghost).await;
+  }
+
+  #[test]
+  fn config_defaults_turn_the_prompt_cache_on() {
+    let cfg = LlamaCppConfig::default();
+    assert_eq!(
+      cfg.prompt_cache_max_bytes,
+      crate::config::DEFAULT_PROMPT_CACHE_MAX_BYTES
+    );
+    assert_ne!(cfg.prompt_cache_max_bytes, 0);
+    // `0` parses (it is the documented disable value), and so does a bare
+    // partial block (other keys keep their defaults).
+    let off: LlamaCppConfig = serde_json::from_str(r#"{"prompt_cache_max_bytes": 0}"#).unwrap();
+    assert_eq!(off.prompt_cache_max_bytes, 0);
+    assert!(off.jinja);
+  }
 }

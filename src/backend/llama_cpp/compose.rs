@@ -110,6 +110,19 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
     argv.push("--fit-ctx".into());
     argv.push(floor.to_string().into());
   }
+  // Prompt cache across unloads: the daemon seeds the per-model slot-save
+  // dir (`seed_launch_cache`) and drives the save/restore endpoints
+  // ([`super::slot_cache`]); the flag itself only tells the server where its
+  // slot files live. Absent when the cache is off or bench parity suppresses
+  // daemon defaults — `--slot-save-path` must name a directory the daemon
+  // created, so it rides with that knowledge and nothing else emits it.
+  if let Some(dir) = params
+    .launch_config
+    .get(super::LLAMACPP_KNOB_SLOT_SAVE_PATH)
+  {
+    argv.push("--slot-save-path".into());
+    argv.push(dir.clone().into());
+  }
   // Emit the device selector verbatim — exactly once. Empty / unset
   // means "let llama-server auto-select" (no flag).
   if let Some(sel) = params
@@ -254,6 +267,30 @@ mod tests {
     let mut p = base_params();
     assert!(p.knobs.set_by_name("load-mode", "none"));
     assert_eq!(strs(&load_mode_argv(&p)), vec!["--no-mmap"]);
+  }
+
+  /// The prompt-cache dir is emitted only when the daemon seeded one: bench
+  /// parity, a disabled cache, and params from before the feature all leave
+  /// the flag out, and `llama-server` needs the flag to accept slot saves.
+  #[test]
+  fn slot_save_path_emits_only_when_seeded() {
+    let mut p = base_params();
+    assert!(
+      !strs(&compose(&p, 41100))
+        .iter()
+        .any(|a| a == "--slot-save-path"),
+      "unseeded launch carries no slot flag"
+    );
+    p.launch_config.insert(
+      super::super::LLAMACPP_KNOB_SLOT_SAVE_PATH.to_string(),
+      "/cache/slot-cache/deadbeef".to_string(),
+    );
+    let argv = strs(&compose(&p, 41100));
+    let at = argv
+      .iter()
+      .position(|a| a == "--slot-save-path")
+      .expect("seeded launch emits the flag");
+    assert_eq!(argv[at + 1], "/cache/slot-cache/deadbeef");
   }
 
   /// **Golden argv (plan D9).** Pins the exact command line for a fully-set
