@@ -17,7 +17,9 @@ use std::{collections::BTreeMap, net::IpAddr, path::PathBuf, time::Duration};
 use anyhow::{Context, Result};
 
 use crate::cli::cli_args::{Cli, DaemonAction, DaemonStartArgs};
-use crate::config::{Config, DefaultLaunchMode, DEFAULT_FIT_CTX_FLOOR, MAX_CTX_TOKENS};
+use crate::config::{
+  Config, DefaultLaunchMode, DEFAULT_FIT_CTX_FLOOR, DEFAULT_PROMPT_CACHE_MAX_MB, MAX_CTX_TOKENS,
+};
 use crate::daemon::discovery_task::DiscoveryOptions;
 use crate::daemon::{
   existing_daemon_pid,
@@ -702,6 +704,16 @@ pub(crate) fn build_options(args: BuildOptionsArgs<'_>) -> Result<DaemonOptions>
   // strict-`"1"` env contract shared with the other boolean envs).
   opts.backend.llamacpp.strict_fit =
     config.backend.llamacpp.strict_fit || env_flag_truthy("LLAMASTASH_STRICT_FIT");
+  // Prompt-cache cap: `0` would delete every file it writes as fast as it writes
+  // them, which reads as "saves are broken" rather than as a limit, so a
+  // fat-fingered zero falls back to the factory cap. `prompt_cache: false` is the
+  // way to switch the feature off.
+  if opts.backend.llamacpp.prompt_cache_max_mb == 0 {
+    log::warn!(
+      "prompt_cache_max_mb 0 would keep nothing; using factory {DEFAULT_PROMPT_CACHE_MAX_MB} MiB"
+    );
+    opts.backend.llamacpp.prompt_cache_max_mb = DEFAULT_PROMPT_CACHE_MAX_MB;
+  }
   // Proxy: config layer first, then CLI / env overrides. Without this
   // thread-through the daemon silently ignored `proxy:` from the config
   // file and ran with `ProxyConfig::default()` regardless.
@@ -1373,6 +1385,30 @@ mod tests {
       opts.backend.llamacpp.strict_fit,
       "LLAMASTASH_STRICT_FIT=1 enables strict"
     );
+  }
+
+  /// A zero cap would delete each saved slot as fast as it is written, which
+  /// reads as a broken feature rather than a limit, so it falls back.
+  #[test]
+  fn build_options_zero_prompt_cache_cap_falls_back_to_factory() {
+    let _env = hermetic_env();
+    let cli = parse_cli(&["daemon", "start"]);
+    let config = Config {
+      backend: crate::backend::BackendConfig {
+        llamacpp: crate::config::LlamaCppConfig {
+          prompt_cache_max_mb: 0,
+          ..Default::default()
+        },
+        ..Default::default()
+      },
+      ..Config::default()
+    };
+    let opts = build_options(BuildOptionsArgs::new(&cli, &config)).expect("build_options");
+    assert_eq!(
+      opts.backend.llamacpp.prompt_cache_max_mb, DEFAULT_PROMPT_CACHE_MAX_MB,
+      "a cap of 0 keeps nothing, so the factory cap applies"
+    );
+    assert!(opts.backend.llamacpp.prompt_cache, "factory default is on");
   }
 
   #[test]

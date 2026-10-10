@@ -226,6 +226,13 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
 async fn stop_launch(ctx: &crate::daemon::context::MethodContext, launch_id: &LaunchId) {
   use crate::backend::Backend;
   let backend = crate::daemon::launch_service::backend_for_launch(ctx, launch_id).await;
+  // An eviction is the one stop that tries to carry the session across. Every
+  // caller here has already established the launch is idle, so this is the last
+  // moment its live prompt cache exists; the backend decides whether anything is
+  // worth writing and never fails the stop.
+  if let Some(model) = ctx.supervisors.get(launch_id).await {
+    backend.preserve_prompt_cache(ctx, &model).await;
+  }
   let _ = backend
     .stop(ctx, launch_id, EVICT_STOP_GRACE.as_secs())
     .await;

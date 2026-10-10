@@ -52,6 +52,13 @@ daemon's state directory:
   (always `127.0.0.1`) but can't check what a foreign binary binds, so
   binding loopback is the entry author's job.
 - The daemon does **not** persist or transmit telemetry.
+- When the proxy unloads a llama.cpp launch, each idle slot's KV cache is
+  written under `$XDG_CACHE_HOME/llamastash/prompt-cache/` so the next launch of
+  that model can resume the conversation instead of reprocessing it. That file
+  holds the conversation's token ids (decodable back to its text with the model
+  file) plus the KV state, unencrypted, under the same same-UID trust as the rest
+  of the on-disk state. `backend.llamacpp.prompt_cache: false` writes nothing; the
+  files are bounded by size and age and are safe to delete at any time.
 
 Issues we treat as in scope:
 

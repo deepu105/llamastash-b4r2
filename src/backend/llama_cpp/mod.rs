@@ -17,6 +17,7 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+mod prompt_cache;
 mod telemetry;
 
 use compose::compose;
@@ -160,6 +161,22 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Keep a stopped launch's prompt cache on disk so the next launch of the same
+  /// model starts warm instead of reprocessing the conversation's prompt
+  /// (factory `true`). llama.cpp only: it is the engine with a slot KV
+  /// save/restore API.
+  #[serde(default = "default_true")]
+  pub prompt_cache: bool,
+  /// Ceiling on the total size of the saved slot caches, in MiB. When the
+  /// directory grows past it, the oldest saved slots go first.
+  /// Factory [`crate::config::DEFAULT_PROMPT_CACHE_MAX_MB`].
+  #[serde(default = "default_prompt_cache_max_mb")]
+  pub prompt_cache_max_mb: u64,
+  /// How many days a saved slot cache stays useful. Older files are dropped when
+  /// a launch is prepared or a save runs. `0` keeps them until the size cap
+  /// evicts them. Factory [`crate::config::DEFAULT_PROMPT_CACHE_TTL_DAYS`].
+  #[serde(default = "default_prompt_cache_ttl_days")]
+  pub prompt_cache_ttl_days: u64,
 }
 
 fn default_true() -> bool {
@@ -170,6 +187,14 @@ fn default_fit_ctx_floor() -> u32 {
   crate::config::DEFAULT_FIT_CTX_FLOOR
 }
 
+fn default_prompt_cache_max_mb() -> u64 {
+  crate::config::DEFAULT_PROMPT_CACHE_MAX_MB
+}
+
+fn default_prompt_cache_ttl_days() -> u64 {
+  crate::config::DEFAULT_PROMPT_CACHE_TTL_DAYS
+}
+
 impl Default for LlamaCppConfig {
   fn default() -> Self {
     Self {
@@ -178,6 +203,9 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      prompt_cache: true,
+      prompt_cache_max_mb: crate::config::DEFAULT_PROMPT_CACHE_MAX_MB,
+      prompt_cache_ttl_days: crate::config::DEFAULT_PROMPT_CACHE_TTL_DAYS,
     }
   }
 }
@@ -463,6 +491,30 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+    // Prompt cache across an unload: seed the directory this launch parks its
+    // slot KV in, which is also what makes `compose` pass `--slot-save-path` and
+    // what the save / restore hooks read back off the launch. Absent (feature
+    // off, bench parity, or the directory could not be made) means no flag and no
+    // hooks, so a llama.cpp build without the endpoint is reached by turning this
+    // off.
+    let cache_dir = if crate::launch::params::bench_disable_defaults_from_env() {
+      None
+    } else {
+      prompt_cache::prepare_dir(cfg)
+    };
+    match cache_dir {
+      Some(dir) => {
+        params.launch_config.insert(
+          prompt_cache::KNOB_PROMPT_CACHE_DIR.to_string(),
+          dir.display().to_string(),
+        );
+      }
+      None => {
+        params
+          .launch_config
+          .remove(prompt_cache::KNOB_PROMPT_CACHE_DIR);
+      }
+    }
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {
@@ -501,6 +553,18 @@ impl Backend for LlamaCppBackend {
   ) -> crate::daemon::actuals::Actuals {
     // The llama-server-specific `/props` fetch + `n_ctx` parse.
     actuals::fetch_props_actuals(port, timeout).await
+  }
+
+  async fn preserve_prompt_cache(
+    &self,
+    ctx: &MethodContext,
+    model: &crate::daemon::supervisor::ManagedModel,
+  ) {
+    prompt_cache::save(model, &ctx.backend.llamacpp).await
+  }
+
+  async fn restore_prompt_cache(&self, model: &crate::daemon::supervisor::ManagedModel) {
+    prompt_cache::restore(model).await
   }
 
   fn gpu_resident(&self, params: &LaunchParams, layer_count: Option<u64>) -> bool {

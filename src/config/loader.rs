@@ -33,6 +33,16 @@ pub const MAX_CTX_TOKENS: u32 = 1_048_576;
 /// upstream floor is too small for real chat sessions).
 pub const DEFAULT_FIT_CTX_FLOOR: u32 = 16384;
 
+/// Factory `prompt_cache_max_mb`: the ceiling on the saved slot KV caches a
+/// llama.cpp launch writes under the cache dir. A 100k-token prompt is a few
+/// GiB on a small model and tens of GiB on a large one, so the cap (not the age
+/// limit) is what usually bounds the directory.
+pub const DEFAULT_PROMPT_CACHE_MAX_MB: u64 = 16_384;
+
+/// Factory `prompt_cache_ttl_days`: how long a saved slot cache is kept. A
+/// conversation nobody returned to is worth its bytes for about a week.
+pub const DEFAULT_PROMPT_CACHE_TTL_DAYS: u64 = 7;
+
 /// User-authored YAML config, with sensible defaults via `#[serde(default)]`.
 ///
 /// Every field is optional in the file; missing fields use the built-in

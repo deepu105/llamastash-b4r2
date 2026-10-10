@@ -446,6 +446,11 @@ impl ManagedModel {
 /// supervisor task continues in the background; on Loading → Ready
 /// it stamps the `ready_at` field and on a probe timeout flips to
 /// `Error{cause}`.
+/// Ceiling on [`Backend::restore_prompt_cache`] for one launch. Restoring a
+/// multi-GiB cache is a disk read (about 1 s per GiB), so this is only ever hit
+/// by an engine that has stopped answering.
+const RESUME_STATE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
   // The binary, argv, env-strip set, and readiness all come from the
   // backend's `prepare_launch` (see `crate::backend`). The supervisor is
@@ -675,6 +680,24 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
           }
         }
         *probe_model.inner.actuals.write().await = actuals;
+        // One chance to pick back up whatever the backend parked on disk for this
+        // launch identity (llama.cpp: the slot KV caches of the launch this one
+        // replaced). It has to happen before the transition: after it, a request
+        // can route against an empty cache and pay for the whole prompt, and the
+        // state read back would land on top of the prompt that request just
+        // built. Bounded so a wedged engine cannot hold a healthy launch out of
+        // service.
+        if tokio::time::timeout(
+          RESUME_STATE_BUDGET,
+          probe_backend.restore_prompt_cache(&probe_model),
+        )
+        .await
+        .is_err()
+        {
+          log::warn!(
+            "supervisor: {RESUME_STATE_BUDGET:?} expired reading parked launch state back; the launch goes Ready without it"
+          );
+        }
         let secs = SystemTime::now()
           .duration_since(UNIX_EPOCH)
           .map(|d| d.as_secs())
