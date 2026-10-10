@@ -70,6 +70,13 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
   if jinja || params.reasoning {
     argv.push("--jinja".into());
   }
+  // Prompt (KV) cache directory (`super::slots`): the flag is what unlocks the
+  // engine's `/slots` save/restore surface for an evicted launch. Absent when
+  // the cache is disabled or its directory could not be created.
+  if let Some(dir) = params.launch_config.get(super::LLAMACPP_KNOB_SLOT_SAVE_DIR) {
+    argv.push("--slot-save-path".into());
+    argv.push(dir.clone().into());
+  }
   argv.extend(load_mode_argv(params));
   if params.reasoning {
     argv.push("--reasoning-format".into());
@@ -195,6 +202,25 @@ mod tests {
 
   fn base_params() -> LaunchParams {
     LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat)
+  }
+
+  /// The eviction prompt cache needs `--slot-save-path`, and needs it only
+  /// when the seed side provisioned a directory.
+  #[test]
+  fn slot_save_path_is_emitted_only_when_seeded() {
+    let without = strs(&compose(&base_params(), 1234));
+    assert!(!without.iter().any(|a| a == "--slot-save-path"));
+    let mut p = base_params();
+    p.launch_config.insert(
+      super::super::LLAMACPP_KNOB_SLOT_SAVE_DIR.to_string(),
+      "/cache/slot-cache".to_string(),
+    );
+    let with = strs(&compose(&p, 1234));
+    let i = with
+      .iter()
+      .position(|a| a == "--slot-save-path")
+      .expect("flag emitted");
+    assert_eq!(with[i + 1], "/cache/slot-cache");
   }
 
   fn with_load_mode(mode: &str, dialect: &str) -> Vec<String> {
