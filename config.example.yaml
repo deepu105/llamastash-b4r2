@@ -545,6 +545,21 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     map_anthropic_effort: true
 
+    # Total byte cap on the prompt caches kept across unloads (all models
+    # together). When the idle sweep or make-room stops a llama.cpp
+    # launch, its slots' KV caches are written to disk first (under the
+    # cache dir); the next launch of that model restores them before its
+    # first request, so a conversation that outlives the unload
+    # reprocesses only its new tail. A cache costs ~32 KB per cached
+    # prompt token (f16 KV) — about 3 GiB for a 100k-context
+    # conversation — and the oldest files are deleted first (other
+    # models before the one being saved) when a save would pass this cap.
+    # `0` disables saving entirely; launches then run without
+    # `--slot-save-path` and evictions keep nothing.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    prompt_cache_max_bytes: 8589934592 # 8 GiB
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend

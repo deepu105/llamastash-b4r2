@@ -82,6 +82,9 @@ backend: # Per-engine config, one block per backend. llama.cpp is the
     strict_fit: false # Refuse (vs degrade) an unplaceable --fit. Env: LLAMASTASH_STRICT_FIT.
     jinja: true # Emit --jinja every launch (tool calling). Config-only.
     map_anthropic_effort: true # Map Anthropic output_config.effort to the engine kwarg. Config-only.
+    prompt_cache_max_bytes: 8589934592 # Cap on KV caches kept across evictions, all models
+             # together (8 GiB). 0 = never save. Config-only. A prompt cache
+             # costs ~32 KB per cached prompt token; see §Preset residency.
   lemonade:
     # servers: [{ binary: /opt/lemonade/lemond }] # lemond path; else PATH.
     # enabled: # tri-state: unset=auto, true=force on, false=force off.
@@ -617,6 +620,8 @@ Beside its launch settings an entry can pin how long it stays loaded and whether
 - `preload: true` — start this preset when the daemon boots. Same as naming it in `daemon.preload`, and the same exemption applies: a preloaded launch is manual intent, so it stays up until you stop it. The preset's key has to name **one** model: a preloaded launch can never be unloaded, so an arch or wide-glob key (which would pin every model it matches) is skipped at boot with a line in the daemon log — name the model, or list them under `daemon.preload` in the order you want them.
 
 A re-save that says nothing about residency keeps whatever the name already pins, even when the save lands under the model's own key and shadows an arch or glob entry of the same name; `--no-idle-ttl` / `--no-preload` are the only way to drop a pin. The one exception is `preload`: a family key's `preload: true` is not carried onto a single-model key, because boot refuses to preload a family and a preloaded launch can never be unloaded — so a `Ctrl+P` recapture cannot start loading your model at boot behind your back. The sweep reads the TTL from the daemon's live preset store on every pass, so `presets save --idle-ttl` moves a running launch's deadline without a relaunch; a hand edit to `config.yaml` needs `daemon restart`, like any other hand edit. When a request cannot be admitted because the host is full, the daemon first tries to make room by unloading idle auto-started launches, least-recently-used first (see §Proxy); launches pinned to `idle_ttl_secs: 0`, launches with a request in flight, and manual or preloaded launches are never picked.
+
+An eviction of a llama.cpp launch is not the end of its conversation. Before the stop, the daemon writes the launch's slot KV caches to the cache dir (under `slot-cache/`, capped in total across all models by `backend.llamacpp.prompt_cache_max_bytes` — factory 8 GiB, `0` disables); the next proxy auto-start of that model restores them before serving the first request, so the returning conversation reprocesses only its new tail (~32 KB of file per cached prompt token). A manual `stop` or a daemon shutdown saves nothing — only an eviction means "this conversation may come back". The daemon log lines (`prompt cache: …`) name the slot counts on both sides.
 
 ### `llamastash favorites`
 

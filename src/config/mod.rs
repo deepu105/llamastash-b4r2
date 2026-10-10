@@ -23,5 +23,5 @@ pub use loader::{
   validate_port_range, validate_scan_settings, CachePathsConfig, Config, ConfigPresetBlock,
   DaemonConfig, DefaultLaunchMode, GpuConfig, KnobValue, KnobValueOpt, LoadedConfig, PortRange,
   PortRangeError, PresetBody, ProxyAlias, ProxyAliases, ProxyConfig, ScanSettingsError,
-  DEFAULT_FIT_CTX_FLOOR, MAX_CTX_TOKENS,
+  DEFAULT_FIT_CTX_FLOOR, DEFAULT_PROMPT_CACHE_MAX_BYTES, MAX_CTX_TOKENS,
 };

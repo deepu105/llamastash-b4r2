@@ -285,7 +285,18 @@ async fn drive_launch_as_leader(
     log::warn!("proxy auto-start: {w}");
   }
 
-  await_ready(state, &started.model).await
+  let outcome = await_ready(state, &started.model).await;
+  if matches!(outcome, LaunchOutcome::Ready { .. }) {
+    use crate::backend::Backend;
+    // The save-on-eviction counterpart: bring back what the last eviction of
+    // this model wrote, *before* this request forwards, so the very first
+    // resumed request already hits the restored cache instead of racing a
+    // background task. No-op for backends that save nothing.
+    let backend =
+      crate::daemon::launch_service::backend_for_launch(&state.ctx, &started.launch_id).await;
+    backend.after_ready(&state.ctx, &started.launch_id).await;
+  }
+  outcome
 }
 
 /// A supervisor already serving `model_id`'s file that this request can

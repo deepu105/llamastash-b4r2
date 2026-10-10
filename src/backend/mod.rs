@@ -393,6 +393,19 @@ pub trait Backend {
   /// generic launch path carries no llama.cpp-specific launch scalars.
   fn seed_launch_knobs(&self, _ctx: &MethodContext, _params: &mut LaunchParams) {}
 
+  /// Seed backend-owned per-model on-disk cache state onto the about-to-launch
+  /// params before argv composition, re-derived every launch (a value
+  /// persisted in `last_params` is overwritten). Default: no-op. llama.cpp
+  /// stamps its prompt-cache slot-save dir (`--slot-save-path`) here, so the
+  /// generic launch path stays free of backend cache paths.
+  fn seed_launch_cache(
+    &self,
+    _ctx: &MethodContext,
+    _identity: &ModelIdentity,
+    _params: &mut LaunchParams,
+  ) {
+  }
+
   /// Ctx floor to project admission memory demand against when `ctx` is unpinned,
   /// or `None` to use a neutral default. Default: `None`.
   fn admission_ctx_floor(&self, _params: &LaunchParams) -> Option<u32> {
@@ -1002,6 +1015,32 @@ pub trait Backend {
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     crate::daemon::launch_service::stop_supervised(ctx, launch_id, grace_secs).await
   }
+
+  /// Called by the eviction sweeper and make-room **right before** they stop a
+  /// launch. Only eviction calls it: a manual stop, a restart, or daemon
+  /// shutdown is not a signal to snapshot anything. A backend whose launches
+  /// hold state worth keeping across a stop uses this to write it out —
+  /// llama.cpp snapshots its slots' prompt caches (the counterpart of
+  /// [`after_ready`](Backend::after_ready)). Best-effort: it may take bounded
+  /// time but reports no error. Default: no-op.
+  async fn before_stop(
+    &self,
+    _ctx: &MethodContext,
+    _launch_id: &crate::daemon::registry::LaunchId,
+  ) {
+  }
+
+  /// Called by the proxy auto-start path between a launch reaching `Ready`
+  /// and its first forwarded request — the counterpart of
+  /// [`before_stop`](Backend::before_stop), bringing back what the last
+  /// eviction wrote. A launch with nothing saved, or a save that no longer
+  /// fits, simply serves cold. Default: no-op.
+  async fn after_ready(
+    &self,
+    _ctx: &MethodContext,
+    _launch_id: &crate::daemon::registry::LaunchId,
+  ) {
+  }
 }
 
 // ============================================================================
@@ -1421,6 +1460,23 @@ impl Backend for Backends {
     grace_secs: u64,
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     for_each_backend!(self, b => b.stop(ctx, launch_id, grace_secs).await)
+  }
+
+  fn seed_launch_cache(
+    &self,
+    ctx: &MethodContext,
+    identity: &ModelIdentity,
+    params: &mut LaunchParams,
+  ) {
+    for_each_backend!(self, b => b.seed_launch_cache(ctx, identity, params))
+  }
+
+  async fn before_stop(&self, ctx: &MethodContext, launch_id: &crate::daemon::registry::LaunchId) {
+    for_each_backend!(self, b => b.before_stop(ctx, launch_id).await)
+  }
+
+  async fn after_ready(&self, ctx: &MethodContext, launch_id: &crate::daemon::registry::LaunchId) {
+    for_each_backend!(self, b => b.after_ready(ctx, launch_id).await)
   }
 }
 

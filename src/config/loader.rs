@@ -33,6 +33,12 @@ pub const MAX_CTX_TOKENS: u32 = 1_048_576;
 /// upstream floor is too small for real chat sessions).
 pub const DEFAULT_FIT_CTX_FLOOR: u32 = 16384;
 
+/// Factory `backend.llamacpp.prompt_cache_max_bytes`: the total size cap on
+/// saved prompt caches (all models together). f16 KV costs ~32 KB per prompt
+/// token, so this holds roughly two 100k-context caches; `0` disables
+/// saving. See `docs/spikes/2026-10-10-prompt-cache-across-unload.md`.
+pub const DEFAULT_PROMPT_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 /// User-authored YAML config, with sensible defaults via `#[serde(default)]`.
 ///
 /// Every field is optional in the file; missing fields use the built-in
