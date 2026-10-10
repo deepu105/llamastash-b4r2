@@ -545,6 +545,26 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     map_anthropic_effort: true
 
+    # Keep a model's prompt cache across an unload (default: true). When the
+    # idle sweep or make-room stops a llama.cpp launch, its KV cache is saved
+    # to disk first and the next launch of the same model restores it, so the
+    # returning conversation skips reprocessing its prompt. Set false to
+    # never save or restore. Files live under
+    # `cache_dir`/prompt-cache/, one per model. (Requires a `llama-server`
+    # build that serves `--slot-save-path`; older builds run normally without
+    # the feature.)
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    # prompt_cache: true
+
+    # Total size cap in MiB for all saved KV files together (default: 8192).
+    # Pruning is oldest-first on every save; the newest save is kept even if
+    # it alone exceeds the cap. Set 0 to disable saving (same as
+    # `prompt_cache: false`).
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    # prompt_cache_max_mb: 8192
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend

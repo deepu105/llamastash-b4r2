@@ -1002,6 +1002,27 @@ pub trait Backend {
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     crate::daemon::launch_service::stop_supervised(ctx, launch_id, grace_secs).await
   }
+
+  /// Called by the proxy eviction paths (idle sweep, make-room) just before
+  /// they stop a launch — a backend that can persist engine state across a
+  /// stop (llama.cpp's slot KV save) does so here, so the eviction stays
+  /// backend-neutral. Manual stops and daemon shutdown never call it: only a
+  /// mid-conversation eviction is worth caching. Default: nothing to persist.
+  async fn before_stop(
+    &self,
+    _ctx: &MethodContext,
+    _launch_id: &crate::daemon::registry::LaunchId,
+  ) {
+  }
+
+  /// Called by the supervisor after the engine's readiness probe passes but
+  /// **before** the launch is announced `Ready`, giving a backend that
+  /// persisted state via [`before_stop`](Backend::before_stop) the chance to
+  /// load it back while no request can land on half-restored slots. Takes the
+  /// port + params the supervisor already holds (no `MethodContext` exists on
+  /// the probe task). Best-effort: a failed restore costs the cache, never
+  /// the launch. Default: nothing to restore.
+  async fn after_ready(&self, _port: u16, _params: &LaunchParams) {}
 }
 
 // ============================================================================
@@ -1421,6 +1442,14 @@ impl Backend for Backends {
     grace_secs: u64,
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     for_each_backend!(self, b => b.stop(ctx, launch_id, grace_secs).await)
+  }
+
+  async fn before_stop(&self, ctx: &MethodContext, launch_id: &crate::daemon::registry::LaunchId) {
+    for_each_backend!(self, b => b.before_stop(ctx, launch_id).await)
+  }
+
+  async fn after_ready(&self, port: u16, params: &LaunchParams) {
+    for_each_backend!(self, b => b.after_ready(port, params).await)
   }
 }
 
