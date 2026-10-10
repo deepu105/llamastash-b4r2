@@ -226,6 +226,11 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
 async fn stop_launch(ctx: &crate::daemon::context::MethodContext, launch_id: &LaunchId) {
   use crate::backend::Backend;
   let backend = crate::daemon::launch_service::backend_for_launch(ctx, launch_id).await;
+  // Hand the prompt cache to disk while the launch is still there to read it from.
+  // The engine cannot save a slot after the process is gone, and this is the last
+  // moment the conversation still exists in memory. Best-effort by contract: a save
+  // that fails must not delay the stop that frees the memory.
+  backend.preserve_prompt_cache(ctx, launch_id).await;
   let _ = backend
     .stop(ctx, launch_id, EVICT_STOP_GRACE.as_secs())
     .await;

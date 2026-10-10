@@ -17,7 +17,10 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+pub mod prompt_cache;
 mod telemetry;
+
+pub use prompt_cache::PromptCacheConfig;
 
 use compose::compose;
 pub use list_devices::{parse_list_devices, probe_devices, BinaryDevice};
@@ -32,6 +35,7 @@ use super::{
 };
 use crate::daemon::context::MethodContext;
 use crate::daemon::probe::ProbeOptions;
+use crate::daemon::registry::LaunchId;
 use crate::launch::params::LaunchParams;
 
 /// Config-derived launch-knob keys llama.cpp carries in
@@ -160,6 +164,11 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Keep a conversation's prompt cache across an unload: save a slot's KV cache to
+  /// disk before an eviction stops the launch, read it back when the model comes
+  /// up again. See [`prompt_cache`].
+  #[serde(default)]
+  pub prompt_cache: PromptCacheConfig,
 }
 
 fn default_true() -> bool {
@@ -178,6 +187,7 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      prompt_cache: PromptCacheConfig::default(),
     }
   }
 }
@@ -463,6 +473,7 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+    prompt_cache::prepare_launch_dir(&cfg.prompt_cache, params);
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {
@@ -501,6 +512,14 @@ impl Backend for LlamaCppBackend {
   ) -> crate::daemon::actuals::Actuals {
     // The llama-server-specific `/props` fetch + `n_ctx` parse.
     actuals::fetch_props_actuals(port, timeout).await
+  }
+
+  async fn preserve_prompt_cache(&self, ctx: &MethodContext, launch_id: &LaunchId) {
+    prompt_cache::preserve(ctx, launch_id).await
+  }
+
+  async fn restore_prompt_cache(&self, port: u16, params: &LaunchParams) {
+    prompt_cache::restore(port, params).await
   }
 
   fn gpu_resident(&self, params: &LaunchParams, layer_count: Option<u64>) -> bool {

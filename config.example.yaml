@@ -545,6 +545,34 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     map_anthropic_effort: true
 
+    # Keep a conversation's prompt cache across an unload (default: true).
+    # When the idle sweep or make-room stops a llama.cpp launch mid-conversation,
+    # every slot holding at least `min_tokens` of prompt is written to disk before
+    # the stop; the next launch of that model reads them back before it serves
+    # anything, so the follow-up reuses the prefix instead of reprocessing it. On a
+    # 100k-token context that is the difference between ~48 minutes of reprocessing
+    # on a CPU and about a second of file read (docs/spikes/
+    # 2026-10-10-prompt-cache-across-unload.md). Chat launches only.
+    #
+    # Files live under `<cache_dir>/prompt-cache/llamacpp/<model>/` and are kept
+    # until they age out or the byte budget evicts them. A cache is only read back
+    # into a launch whose server arguments agree about what the cached bytes mean
+    # (KV cache types, flash attention, slot count, speculation); the device a model
+    # runs on and the size of its window do not void it.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    prompt_cache:
+      enabled: true
+      # Don't save a slot holding fewer prompt tokens than this; below it the file
+      # is a few MB and reprocessing it costs under a second on a GPU.
+      min_tokens: 512
+      # Disk budget per model directory. Over it, the oldest saves go first.
+      # A 100k-token context costs about 3 GiB per saved slot at the default KV type.
+      max_bytes: 4294967296
+      # Forget a saved cache older than this; a conversation that has not come back
+      # within the window is not coming back.
+      max_age_secs: 21600
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend

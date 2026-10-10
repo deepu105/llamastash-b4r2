@@ -120,6 +120,14 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
     knob_argv.push("--device".into());
     knob_argv.push(sel.into());
   }
+  // The prompt-cache directory, when this launch has one (`prepare_launch_dir`
+  // created it and stamped it on `launch_config`). It is what makes
+  // `POST /slots/{id}?action=save` work, so it rides on every chat launch and not
+  // only the ones with something already saved.
+  if let Some(dir) = super::prompt_cache::slot_save_path_arg(params) {
+    argv.push("--slot-save-path".into());
+    argv.push(dir.into());
+  }
   argv.extend(knob_argv);
   // Defensive strip: refuse to pass loopback-breaking flags even if
   // an upstream validator was skipped. Last-occurrence semantics in
@@ -195,6 +203,26 @@ mod tests {
 
   fn base_params() -> LaunchParams {
     LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat)
+  }
+
+  /// The prompt-cache directory only reaches the argv when the backend stamped one
+  /// on the launch (`prepare_launch_dir`); without it `/slots?action=save` is off.
+  #[test]
+  fn slot_save_path_rides_only_on_a_launch_that_has_one() {
+    let plain = strs(&compose(&base_params(), 8080));
+    assert!(!plain.iter().any(|a| a == "--slot-save-path"), "{plain:?}");
+
+    let mut cached = base_params();
+    cached.launch_config.insert(
+      super::super::prompt_cache::LLAMACPP_KNOB_PROMPT_CACHE_DIR.to_string(),
+      "/cache/prompt-cache/llamacpp/abcd".to_string(),
+    );
+    let argv = strs(&compose(&cached, 8080));
+    let at = argv
+      .iter()
+      .position(|a| a == "--slot-save-path")
+      .expect("flag emitted");
+    assert_eq!(argv[at + 1], "/cache/prompt-cache/llamacpp/abcd");
   }
 
   fn with_load_mode(mode: &str, dialect: &str) -> Vec<String> {

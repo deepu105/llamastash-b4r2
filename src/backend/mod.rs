@@ -1002,6 +1002,28 @@ pub trait Backend {
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     crate::daemon::launch_service::stop_supervised(ctx, launch_id, grace_secs).await
   }
+
+  /// Give this launch's prompt cache to disk before an eviction stops it, so a later
+  /// launch of the same model can resume the conversation instead of reprocessing
+  /// the whole prompt. Only the eviction paths (idle sweep, make-room) call it: a
+  /// stop the user asked for is the end of that conversation.
+  ///
+  /// Called with the launch still running, immediately before
+  /// [`stop`](Backend::stop). Best-effort by contract — an implementation that
+  /// cannot save must log and return rather than hold up the stop, which is what
+  /// gives back the memory.
+  async fn preserve_prompt_cache(
+    &self,
+    _ctx: &MethodContext,
+    _launch_id: &crate::daemon::registry::LaunchId,
+  ) {
+  }
+
+  /// Rehydrate a prompt cache [`preserve_prompt_cache`](Backend::preserve_prompt_cache)
+  /// wrote into a child that has just become reachable, before it is declared Ready
+  /// and sees its first request. Best-effort: a launch that restores nothing behaves
+  /// the way it did before the feature existed.
+  async fn restore_prompt_cache(&self, _port: u16, _params: &LaunchParams) {}
 }
 
 // ============================================================================
@@ -1171,6 +1193,18 @@ impl Backend for Backends {
     timeout: std::time::Duration,
   ) -> crate::daemon::actuals::Actuals {
     for_each_backend!(self, b => b.fetch_actuals(port, timeout).await)
+  }
+
+  async fn preserve_prompt_cache(
+    &self,
+    ctx: &MethodContext,
+    launch_id: &crate::daemon::registry::LaunchId,
+  ) {
+    for_each_backend!(self, b => b.preserve_prompt_cache(ctx, launch_id).await)
+  }
+
+  async fn restore_prompt_cache(&self, port: u16, params: &LaunchParams) {
+    for_each_backend!(self, b => b.restore_prompt_cache(port, params).await)
   }
 
   fn speculation_set_in_extras(&self, extras: &[OsString]) -> bool {

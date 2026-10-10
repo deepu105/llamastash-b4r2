@@ -66,6 +66,10 @@ struct Args {
   #[cfg_attr(not(unix), allow(dead_code))]
   sigterm_exit_delay_ms: Option<u64>,
   print_env: Vec<String>,
+  /// `--slot-save-path <DIR>` — where `llama-server` keeps slot prompt caches. The
+  /// fixture serves the save/restore endpoints against it (see the `/slots`
+  /// handlers), which is how a test can watch the daemon's prompt-cache paths.
+  slot_save_path: Option<String>,
   /// Set when launched with `--spec-type draft-mtp` (MTP speculative decoding).
   /// Makes the fixture print a `draft acceptance = …` slot-timing line to
   /// stderr at startup so the daemon's log ring buffer carries it, exactly like
@@ -129,6 +133,7 @@ fn parse_args() -> Args {
   let mut trap_sigterm = false;
   let mut sigterm_exit_delay_ms = None;
   let mut print_env = Vec::new();
+  let mut slot_save_path = None;
   let mut spec_mtp = false;
   while let Some(arg) = args.next() {
     match arg.as_str() {
@@ -150,6 +155,7 @@ fn parse_args() -> Args {
         sigterm_exit_delay_ms = args.next().and_then(|v| v.parse().ok());
       }
       "--print-env" => print_env.extend(args.next()),
+      "--slot-save-path" => slot_save_path = args.next(),
       // Silently ignore unknown flags so the supervisor can pass
       // through reasoning bundles + advanced overrides without
       // teaching the fixture every llama-server flag.
@@ -167,6 +173,7 @@ fn parse_args() -> Args {
     trap_sigterm,
     sigterm_exit_delay_ms,
     print_env,
+    slot_save_path,
     spec_mtp,
   }
 }
@@ -328,6 +335,98 @@ async fn handle(
   let mut body = vec![0u8; content_length];
   if content_length > 0 {
     br.read_exact(&mut body).await?;
+  }
+
+  // llama.cpp's slot prompt-cache surface, which only exists when the server was
+  // launched with `--slot-save-path`: `GET /slots` reports one idle slot holding a
+  // prompt (and one busy one, so a test can see the busy slot is skipped), `save`
+  // writes the file into that directory, and `restore` answers only for a file that
+  // is there and logs the call to `restores.log` so a test can see it land.
+  if method == "GET" && path == "/slots" {
+    let n_prompt: u64 = std::env::var("FAKE_SLOT_TOKENS")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(4096);
+    let body = serde_json::json!([
+      {"id": 0, "n_ctx": 4096, "is_processing": false, "n_prompt_tokens": n_prompt},
+      {"id": 1, "n_ctx": 4096, "is_processing": true, "n_prompt_tokens": 8192},
+    ]);
+    return write_response(
+      &mut wr,
+      200,
+      "application/json",
+      body.to_string().as_bytes(),
+    )
+    .await;
+  }
+  if method == "POST" && path.starts_with("/slots/") {
+    let (slot_path, query) = match path.split_once('?') {
+      Some((p, q)) => (p, q),
+      None => (path.as_str(), ""),
+    };
+    let id_slot = slot_path.trim_start_matches("/slots/").to_string();
+    let action = query
+      .split('&')
+      .find_map(|kv| kv.strip_prefix("action="))
+      .unwrap_or("")
+      .to_string();
+    let filename = serde_json::from_slice::<serde_json::Value>(&body)
+      .ok()
+      .and_then(|v| {
+        v.get("filename")
+          .and_then(|f| f.as_str())
+          .map(str::to_string)
+      });
+    let error = |message: &str| {
+      serde_json::json!({"error": {"code": 400, "message": message, "type": "invalid_request_error"}})
+        .to_string()
+    };
+    let reply = match (&args.slot_save_path, filename, action.as_str()) {
+      (None, _, _) => (
+        400,
+        error("This server does not support slots action. Start it with `--slot-save-path`"),
+      ),
+      (_, None, _) => (400, error("Invalid filename")),
+      (Some(dir), Some(name), "save") => {
+        let payload = vec![7u8; 1024];
+        match std::fs::write(std::path::Path::new(dir).join(&name), &payload) {
+          Ok(()) => (
+            200,
+            serde_json::json!({"id_slot": id_slot, "filename": name, "n_saved": 4096,
+                                "n_written": payload.len(), "timings": {"save_ms": 1.0}})
+            .to_string(),
+          ),
+          Err(e) => (500, error(&format!("Unable to save slot: {e}"))),
+        }
+      }
+      (Some(dir), Some(name), "restore") => {
+        let file = std::path::Path::new(dir).join(&name);
+        if file.is_file() {
+          let log = std::path::Path::new(dir).join("restores.log");
+          let line = format!("restore {id_slot} {name}\n");
+          let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+          (
+            200,
+            serde_json::json!({"id_slot": id_slot, "filename": name, "n_restored": 4096,
+                                "n_read": 1024, "timings": {"restore_ms": 1.0}})
+            .to_string(),
+          )
+        } else {
+          (
+            400,
+            error(
+              "Unable to restore slot: No available space in KV cache or invalid slot save file",
+            ),
+          )
+        }
+      }
+      (_, _, other) => (400, error(&format!("Invalid action {other:?}"))),
+    };
+    return write_response(&mut wr, reply.0, "application/json", reply.1.as_bytes()).await;
   }
 
   match (method.as_str(), path.as_str()) {
