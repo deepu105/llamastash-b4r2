@@ -17,6 +17,7 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+mod slotcache;
 mod telemetry;
 
 use compose::compose;
@@ -160,10 +161,33 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Keep a stopped chat launch's KV prompt cache on disk and load it back into
+  /// the next launch of the same model (factory `false`). llama.cpp writes
+  /// each idle slot's cache before a graceful stop and llamastash restores it
+  /// after the next launch is servable, so a returning conversation skips
+  /// prompt reprocessing. Files live under `cache_dir/slot-cache/`.
+  #[serde(default)]
+  pub slot_cache: bool,
+  /// Total size cap across all kept slot caches in bytes; the least-recently
+  /// saved files are dropped first. Only read when `slot_cache` is on.
+  #[serde(default = "default_slot_cache_max_bytes")]
+  pub slot_cache_max_bytes: u64,
+  /// Slot cache files untouched for this many days are deleted (and never
+  /// restored). Only read when `slot_cache` is on.
+  #[serde(default = "default_slot_cache_ttl_days")]
+  pub slot_cache_ttl_days: u64,
 }
 
 fn default_true() -> bool {
   true
+}
+
+fn default_slot_cache_max_bytes() -> u64 {
+  8 * 1024 * 1024 * 1024
+}
+
+fn default_slot_cache_ttl_days() -> u64 {
+  7
 }
 
 fn default_fit_ctx_floor() -> u32 {
@@ -178,6 +202,9 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      slot_cache: false,
+      slot_cache_max_bytes: default_slot_cache_max_bytes(),
+      slot_cache_ttl_days: default_slot_cache_ttl_days(),
     }
   }
 }
@@ -463,6 +490,15 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+    slotcache::seed(cfg, params);
+  }
+
+  async fn prepare_to_stop(&self, port: u16, params: &LaunchParams) {
+    slotcache::prepare_to_stop(port, params).await;
+  }
+
+  async fn on_launch_ready(&self, port: u16, params: &LaunchParams) {
+    slotcache::on_launch_ready(port, params).await;
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {

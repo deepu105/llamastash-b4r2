@@ -545,6 +545,28 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     map_anthropic_effort: true
 
+    # Keep chat launches' KV prompt caches across an unload (default: false).
+    # Before a graceful stop, each idle slot's prompt cache is written to disk;
+    # the next launch of the same model loads it back before going Ready, so a
+    # returning conversation skips prompt reprocessing. Files live under
+    # `cache_dir/slot-cache/` and are bounded by the two keys below.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    slot_cache: false
+
+    # Total size cap in bytes across all kept slot caches; the
+    # least-recently-saved files are dropped first. Only read when
+    # `slot_cache` is on.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    slot_cache_max_bytes: 8589934592
+
+    # Slot cache files untouched for this many days are deleted and never
+    # restored. Only read when `slot_cache` is on.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    slot_cache_ttl_days: 7
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend

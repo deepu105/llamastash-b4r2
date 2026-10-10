@@ -75,6 +75,16 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
     argv.push("--reasoning-format".into());
     argv.push("deepseek".into());
   }
+  // Cross-unload prompt cache (config `backend.llamacpp.slot_cache`, seeded
+  // into `launch_config` by the backend): llama-server writes and reads slot
+  // KV state under this directory. Emitted only when seeded — off by default.
+  if let Some(dir) = params
+    .launch_config
+    .get(super::slotcache::LLAMACPP_KNOB_SLOT_SAVE_PATH)
+  {
+    argv.push("--slot-save-path".into());
+    argv.push(dir.clone().into());
+  }
   // MTP speculative decoding — emitted BEFORE the ctx / `--fit-ctx` block so
   // llama.cpp's `--fit` reserves the MTP draft context (KD6). The directive was
   // resolved server-side (`compose_and_spawn` → `resolve_mtp_directive`) against
@@ -572,5 +582,28 @@ mod tests {
     assert!(p.knobs.str(crate::launch::knobs::kid("device")).is_none());
     let argv = strs(&compose(&p, 41100));
     assert!(!argv.iter().any(|a| *a == "--device"));
+  }
+
+  // ---- Slot-cache (prompt cache across unload) tests ----
+
+  #[test]
+  fn compose_emits_slot_save_path_when_seeded() {
+    let mut p = base_params();
+    p.launch_config.insert(
+      super::super::slotcache::LLAMACPP_KNOB_SLOT_SAVE_PATH.to_string(),
+      "/cache/slot-cache/abc".to_string(),
+    );
+    let argv = strs(&compose(&p, 41100));
+    let pos = argv
+      .iter()
+      .position(|a| a == "--slot-save-path")
+      .expect("flag emitted");
+    assert_eq!(argv[pos + 1], "/cache/slot-cache/abc");
+  }
+
+  #[test]
+  fn compose_omits_slot_save_path_when_unseeded() {
+    let argv = strs(&compose(&base_params(), 41100));
+    assert!(!argv.iter().any(|a| a == "--slot-save-path"));
   }
 }

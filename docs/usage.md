@@ -82,6 +82,9 @@ backend: # Per-engine config, one block per backend. llama.cpp is the
     strict_fit: false # Refuse (vs degrade) an unplaceable --fit. Env: LLAMASTASH_STRICT_FIT.
     jinja: true # Emit --jinja every launch (tool calling). Config-only.
     map_anthropic_effort: true # Map Anthropic output_config.effort to the engine kwarg. Config-only.
+    # slot_cache: false      # Keep chat KV prompt caches across an unload (save on stop, restore on relaunch). Config-only.
+    # slot_cache_max_bytes: 8589934592 # Cap on kept slot-cache files; oldest saved evict first.
+    # slot_cache_ttl_days: 7           # Slot-cache files older than this are dropped, never restored.
   lemonade:
     # servers: [{ binary: /opt/lemonade/lemond }] # lemond path; else PATH.
     # enabled: # tri-state: unset=auto, true=force on, false=force off.
@@ -1492,6 +1495,14 @@ Every non-2xx response carries an OpenAI-shaped JSON body:
 | 503  | `launch_failed`                                              | Auto-start failed and no Ready models exist for fallback. `running: []` is always present on this arm. The list reflects models that were **in `Ready` state at the moment the proxy snapshotted the supervisor registry for fallback** — models in `Launching` / `Loading` are not included, so an empty list does not mean "the daemon has nothing alive," only "no candidate was available for instant fallback." Retry once the slow launch completes. |
 
 Upstream non-2xx responses (e.g. `llama-server` returns 500 for a malformed completion request) are passed through verbatim — same status code, same body bytes; the OpenAI-shape envelope above only covers errors the proxy itself emits. Mid-stream upstream death: once headers are sent the routing decision is committed; if the upstream stream errors after that point, the proxy closes its connection to the agent (the agent sees a truncated SSE / chunked body) — no retry, no fallback.
+
+### Prompt cache across unloads (llama.cpp, opt-in)
+
+When the idle sweep or a make-room pass unloads a model mid-conversation, the next request to that model reprocesses the whole prompt from zero. With `backend.llamacpp.slot_cache: true`, llama.cpp writes each idle slot's KV prompt cache to disk in the seconds before an eviction stop, and loads it back into the same slot ids when the same model launches again — before the launch turns Ready, so the first returning request finds it warm. The engine's own prompt-similarity slot routing then matches the returning conversation to the restored slot; llamastash only moves the bytes. A follow-up on a long prompt pays a restore (seconds) instead of a full reprocess (tens of seconds to minutes on CPU), and the request's own usage reports it: `usage.prompt_tokens_details.cached_tokens` (OpenAI routes) or `cache_read_input_tokens` (Anthropic routes) covers the restored prefix instead of the whole prompt. Saving costs an eviction a small delay (bounded at 30 s) and the files cost disk:
+
+- Files live under `<cache dir>/slot-cache/<model-hash>/` (one directory per model path; `llamastash daemon stop` does not delete them).
+- Only chat launches are saved, only prompts of at least 1024 tokens, and only when the proxy evicts a launch — a manual stop, daemon shutdown, crash or `SIGKILL` saves nothing.
+- `slot_cache_max_bytes` caps the total (default 8 GiB, least-recently-saved files dropped first); `slot_cache_ttl_days` (default 7) drops untouched files and refuses to restore them. A file is also deleted once used or when the engine rejects it (model swapped at the same path, a different context layout — the restore just fails that slot, the launch proceeds normally).
 
 ### Configuration
 
