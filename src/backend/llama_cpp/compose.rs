@@ -94,6 +94,20 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
       argv.push(n.to_string().into());
     }
   }
+  // Prompt cache across an unload: where `POST /slots/{id}?action=save|restore`
+  // files live. Emitted only when the seed found a cache entry for this model and
+  // the resolved binary advertises the flag (`seed_binary_caps`); absent either,
+  // the argv is byte-identical to a launch without the feature.
+  if let Some(dir) = params.launch_config.get(super::prompt_cache::CFG_DIR) {
+    if params
+      .launch_config
+      .get(super::prompt_cache::CFG_SUPPORTED)
+      .is_some_and(|s| s == "true")
+    {
+      argv.push("--slot-save-path".into());
+      argv.push(dir.clone().into());
+    }
+  }
   // Context window: a pinned `ctx` emits `-c <N>` and suppresses
   // `--fit-ctx` (fit honors the pin). An unset `ctx` (Auto / Inherited)
   // emits `--fit-ctx <floor>` (floor from the config-derived `fit_ctx_floor`
@@ -350,6 +364,44 @@ mod tests {
     assert!(!argv
       .iter()
       .any(|a| a == "--embeddings" || a == "--reranking"));
+  }
+
+  /// The prompt-cache flag rides its two `launch_config` keys: the seeded entry
+  /// directory plus the probed binary capability. Either alone emits nothing, so
+  /// the default argv stays byte-identical without the feature.
+  #[test]
+  fn slot_save_path_emits_only_with_entry_and_capability() {
+    let mut p = base_params();
+    p.launch_config.insert(
+      super::super::prompt_cache::CFG_DIR.to_string(),
+      "/state/slot-cache/abcd".to_string(),
+    );
+    let argv = strs(&compose(&p, 41100));
+    assert!(
+      !argv.iter().any(|a| a == "--slot-save-path"),
+      "no capability marker: nothing emitted"
+    );
+    p.launch_config.insert(
+      super::super::prompt_cache::CFG_SUPPORTED.to_string(),
+      "false".to_string(),
+    );
+    let argv2 = strs(&compose(&p, 41100));
+    assert!(
+      !argv2.iter().any(|a| a == "--slot-save-path"),
+      "capability false: nothing emitted"
+    );
+    p.launch_config.insert(
+      super::super::prompt_cache::CFG_SUPPORTED.to_string(),
+      "true".to_string(),
+    );
+    let argv3 = strs(&compose(&p, 41100));
+    let i = argv3.iter().position(|a| a == "--slot-save-path").unwrap();
+    assert_eq!(argv3[i + 1], "/state/slot-cache/abcd");
+    // Extras still win last: the forbidden-flag contract is untouched.
+    p.extras = vec!["--slot-save-path".into(), "/elsewhere".into()];
+    let argv4 = strs(&compose(&p, 41100));
+    let last = argv4.iter().rposition(|a| a == "--slot-save-path").unwrap();
+    assert_eq!(argv4[last + 1], "/elsewhere");
   }
 
   #[test]

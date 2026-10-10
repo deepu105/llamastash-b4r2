@@ -17,6 +17,7 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+mod prompt_cache;
 mod telemetry;
 
 use compose::compose;
@@ -49,6 +50,9 @@ pub const LLAMACPP_KNOB_FIT_CTX_FLOOR: &str = "fit_ctx_floor";
 pub const LLAMACPP_KNOB_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
 /// The same fact as a [`caps`] probe key on `Server::caps`.
 pub const CAP_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
+/// Whether the build advertises `--slot-save-path` (the prompt-cache flag), as a
+/// [`caps`] probe key on `Server::caps` and as the matching `launch_config` key.
+pub const CAP_SLOT_CACHE: &str = "slot_cache";
 
 /// The `fit_ctx_floor` launch knob parsed to `u32`, or `None` when unseeded /
 /// unparsable. Shared by the admission-floor and readiness-gate hooks.
@@ -160,6 +164,22 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Keep a launched model's prompt cache across an unload (factory `true`). On an
+  /// idle-sweep or make-room eviction the launch's slot caches are saved to disk
+  /// and restored into the next launch of the same model, so a returning
+  /// conversation does not reprocess its prompt. llama.cpp launches only; saves
+  /// live under the state dir (`slot-cache/`).
+  #[serde(default = "default_true")]
+  pub prompt_cache: bool,
+  /// Total size cap across every saved prompt-cache entry, as a suffixed byte
+  /// count (`16G`, `512M`). Oldest entries are dropped past it at save time.
+  /// An unparsable value falls back to `16G`.
+  #[serde(default = "default_prompt_cache_max_bytes")]
+  pub prompt_cache_max_bytes: String,
+  /// How many days a saved prompt-cache entry may go unused before it is pruned.
+  /// `0` disables age pruning; the size cap still applies.
+  #[serde(default = "default_prompt_cache_max_age_days")]
+  pub prompt_cache_max_age_days: u64,
 }
 
 fn default_true() -> bool {
@@ -170,6 +190,14 @@ fn default_fit_ctx_floor() -> u32 {
   crate::config::DEFAULT_FIT_CTX_FLOOR
 }
 
+fn default_prompt_cache_max_bytes() -> String {
+  "16G".to_string()
+}
+
+fn default_prompt_cache_max_age_days() -> u64 {
+  7
+}
+
 impl Default for LlamaCppConfig {
   fn default() -> Self {
     Self {
@@ -178,6 +206,9 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      prompt_cache: true,
+      prompt_cache_max_bytes: default_prompt_cache_max_bytes(),
+      prompt_cache_max_age_days: default_prompt_cache_max_age_days(),
     }
   }
 }
@@ -375,9 +406,27 @@ impl Backend for LlamaCppBackend {
 
   fn probe_caps(&self, binary: &Path) -> std::collections::BTreeMap<String, String> {
     let mut caps = std::collections::BTreeMap::new();
+    // One `--help` subprocess per binary answers every flag-shape question.
+    // An unreadable help reads as the old dialect and no slot-cache support.
+    let help = caps::server_help(binary);
     caps.insert(
       CAP_LOAD_MODE_DIALECT.to_string(),
-      caps::LoadModeDialect::probe(binary).label().to_string(),
+      match &help {
+        Some(text) => caps::LoadModeDialect::from_help(text).label().to_string(),
+        None => {
+          log::warn!(
+            "`{} --help` failed; assuming the pre-`--load-mode` flags",
+            binary.display()
+          );
+          caps::LoadModeDialect::Flags.label().to_string()
+        }
+      },
+    );
+    caps.insert(
+      CAP_SLOT_CACHE.to_string(),
+      help
+        .map(|text| caps::slot_save_supported_from_help(&text).to_string())
+        .unwrap_or_else(|| "false".to_string()),
     );
     caps
   }
@@ -403,6 +452,22 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_LOAD_MODE_DIALECT.to_string(),
       dialect.label().to_string(),
     );
+    // The slot-cache capability rides the same catalog/fallback split: it gates
+    // whether `compose` may emit `--slot-save-path` for this binary.
+    let slot_cache = match servers.iter().find(|s| s.binary == binary) {
+      Some(server) => server
+        .caps
+        .get(CAP_SLOT_CACHE)
+        .map(String::as_str)
+        .unwrap_or("false")
+        .to_string(),
+      None => caps::server_help(binary)
+        .map(|text| caps::slot_save_supported_from_help(&text).to_string())
+        .unwrap_or_else(|| "false".to_string()),
+    };
+    params
+      .launch_config
+      .insert(prompt_cache::CFG_SUPPORTED.to_string(), slot_cache);
   }
 
   fn launch_priority(&self) -> i32 {
@@ -463,6 +528,34 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+    // Prompt cache across an unload: seed the entry directory and the pruning
+    // limits (config projection, same channel as `jinja`). The `--slot-save-path`
+    // argv and the save/restore hooks stay dark until `seed_binary_caps` also
+    // marks the resolved binary as advertising the flag. The bench parity escape
+    // hatch skips the seed so `start` stays byte-identical to raw `llama-server`.
+    if cfg.prompt_cache && !crate::launch::params::bench_disable_defaults_from_env() {
+      let max_bytes =
+        if crate::launch::admission::parse_size_bytes(&cfg.prompt_cache_max_bytes).is_some() {
+          cfg.prompt_cache_max_bytes.clone()
+        } else {
+          log::warn!(
+            "backend.llamacpp.prompt_cache_max_bytes {:?} is not a size (e.g. 16G); using 16G",
+            cfg.prompt_cache_max_bytes
+          );
+          "16G".to_string()
+        };
+      for (key, value) in prompt_cache::seed(
+        &params.model_path,
+        &max_bytes,
+        cfg.prompt_cache_max_age_days,
+      ) {
+        params.launch_config.insert(key, value);
+      }
+    } else {
+      params.launch_config.remove(prompt_cache::CFG_DIR);
+      params.launch_config.remove(prompt_cache::CFG_MAX_BYTES);
+      params.launch_config.remove(prompt_cache::CFG_MAX_AGE_DAYS);
+    }
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {
@@ -501,6 +594,17 @@ impl Backend for LlamaCppBackend {
   ) -> crate::daemon::actuals::Actuals {
     // The llama-server-specific `/props` fetch + `n_ctx` parse.
     actuals::fetch_props_actuals(port, timeout).await
+  }
+
+  async fn before_eviction_stop(&self, port: u16, params: &LaunchParams) {
+    // Write the slot caches to disk while the server is still up, so the next
+    // launch of this model can restore them. Best-effort inside.
+    prompt_cache::save_before_eviction(port, params).await;
+  }
+
+  async fn after_launch_ready(&self, port: u16, params: &LaunchParams) {
+    // Read a previous eviction's slot caches back into this launch.
+    prompt_cache::restore_after_ready(port, params).await;
   }
 
   fn gpu_resident(&self, params: &LaunchParams, layer_count: Option<u64>) -> bool {

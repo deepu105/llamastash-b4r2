@@ -428,7 +428,7 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 4: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
-- [ ] Keep a model's prompt cache across an unload
+- [x] ~~Keep a model's prompt cache across an unload~~ — done: the idle sweep and make-room save each slot's cached prompt to the state dir (`slot-cache/`) before stopping a llama.cpp launch, and the next launch of the same model file restores them before Ready; llama.cpp's own prefix matching hands the restored slot to the returning conversation. Fingerprint guard, age and size pruning, and a `--help` capability probe gate it; `backend.llamacpp.prompt_cache` (default on). Spike and design: `docs/spikes/2026-10-10-prompt-cache-across-unload.md`, `docs/architecture.md` § Model lifecycle.
 - [ ] Warm the page cache before a load (`llamastash warm <model>`)
 
 ### Batch 5: CLI setup commands ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-5-cli-setup-commands))
