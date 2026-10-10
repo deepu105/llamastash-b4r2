@@ -204,7 +204,16 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
     tokio::spawn(async move {
       // The snapshot is a moment old by the time this runs: a request that
       // landed in that window must not be cut off mid-generation.
-      if !matches!(model.state().await, ManagedState::Ready) || model.inflight() > 0 {
+      if busy(&model).await {
+        log::debug!(
+          "proxy eviction: {} busy again — left running",
+          launch_id.as_str()
+        );
+        return;
+      }
+      before_evict(&model).await;
+      // The hook can take seconds; a request that arrived meanwhile wins.
+      if busy(&model).await {
         log::debug!(
           "proxy eviction: {} busy again — left running",
           launch_id.as_str()
@@ -216,6 +225,20 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
       stop_launch(&ctx, &launch_id).await;
     });
   }
+}
+
+async fn busy(model: &ManagedModel) -> bool {
+  !matches!(model.state().await, ManagedState::Ready) || model.inflight() > 0
+}
+
+/// Give the launch's backend its chance to keep something across the unload.
+/// A multiplexer row passes its umbrella here, whose backend has nothing to do.
+async fn before_evict(model: &ManagedModel) {
+  use crate::backend::Backend;
+  model
+    .backend()
+    .before_evict(model.params(), model.port())
+    .await;
 }
 
 /// Stop one launch through its own backend — the path `stop_model` uses, so the
@@ -419,9 +442,14 @@ pub async fn make_room(
   let mut go: Vec<RoomCandidate> = Vec::new();
   let mut freed_now = 0u64;
   for candidate in picked {
-    if !matches!(candidate.guard.state().await, ManagedState::Ready)
-      || candidate.guard.inflight() > 0
-    {
+    // The hook runs between two busy checks: it can take seconds, and the
+    // all-or-nothing decision below must be made on what is idle after it.
+    let mut is_busy = busy(&candidate.guard).await;
+    if !is_busy {
+      before_evict(&candidate.guard).await;
+      is_busy = busy(&candidate.guard).await;
+    }
+    if is_busy {
       log::info!(
         "proxy make-room: {} is busy again — left it running",
         candidate.targets[0].as_str(),

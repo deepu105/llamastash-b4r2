@@ -424,6 +424,18 @@ pub trait Backend {
     crate::daemon::actuals::Actuals::default()
   }
 
+  /// Called right before the idle sweep or make-room unloads this launch, while
+  /// it is still `Ready` and has no request in flight. Not called for a manual
+  /// stop or a daemon shutdown. Default: no-op. A backend whose server can write
+  /// its prompt cache to disk does so here.
+  async fn before_evict(&self, _params: &LaunchParams, _port: u16) {}
+
+  /// Called once on the Loading → Ready transition, before the launch is
+  /// reported `Ready` and takes traffic. Default: no-op. The counterpart of
+  /// [`before_evict`](Backend::before_evict): a backend reads back here what it
+  /// wrote there.
+  async fn after_ready(&self, _params: &LaunchParams, _port: u16) {}
+
   /// Whether `extras` already configures speculative decoding by hand, in which
   /// case llamastash defers entirely and adds none of its own (KD3).
   ///
@@ -1171,6 +1183,14 @@ impl Backend for Backends {
     timeout: std::time::Duration,
   ) -> crate::daemon::actuals::Actuals {
     for_each_backend!(self, b => b.fetch_actuals(port, timeout).await)
+  }
+
+  async fn before_evict(&self, params: &LaunchParams, port: u16) {
+    for_each_backend!(self, b => b.before_evict(params, port).await)
+  }
+
+  async fn after_ready(&self, params: &LaunchParams, port: u16) {
+    for_each_backend!(self, b => b.after_ready(params, port).await)
   }
 
   fn speculation_set_in_extras(&self, extras: &[OsString]) -> bool {

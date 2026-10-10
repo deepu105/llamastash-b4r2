@@ -217,6 +217,13 @@ async fn forward_ui(
   req: Request<Incoming>,
   entry: RunningEntry,
 ) -> ProxyResponse {
+  if is_slot_action(req.method(), &strip_ui_prefix(req.uri())) {
+    return super::router::error_response(
+      StatusCode::FORBIDDEN,
+      "forbidden",
+      "slot actions are not available through /ui",
+    );
+  }
   let (method, uri, headers, body) = forward::deconstruct(req);
   // Buffer the body under the daemon's cap via the same helper the
   // data plane uses. UI asset GETs are bodyless; the base-relative API
@@ -263,6 +270,14 @@ fn strip_ui_prefix(uri: &hyper::Uri) -> String {
     Some(rest) if rest.starts_with('/') => rest.to_string(),
     _ => "/".to_string(),
   }
+}
+
+/// A write to one slot of the upstream server (`POST /slots/<id>?action=…`):
+/// save a slot's cache to a file on the host, load one, or erase it. The web UI
+/// only reads `GET /slots`, and `/ui` is the one route that reaches upstream
+/// paths outside the API surface, so these stop here.
+fn is_slot_action(method: &hyper::Method, upstream_path_and_query: &str) -> bool {
+  method != hyper::Method::GET && upstream_path_and_query.starts_with("/slots/")
 }
 
 // ─── cookie + query helpers ───────────────────────────────────────────
@@ -526,6 +541,26 @@ mod tests {
       !green.is_empty() && !red.is_empty() && green != red,
       "{green} vs {red}"
     );
+  }
+
+  #[test]
+  fn slot_actions_are_refused_and_slot_reads_are_not() {
+    use hyper::Method;
+    let upstream = |s: &str| strip_ui_prefix(&s.parse::<hyper::Uri>().unwrap());
+    assert!(is_slot_action(
+      &Method::POST,
+      &upstream("/ui/slots/0?action=save")
+    ));
+    assert!(is_slot_action(
+      &Method::POST,
+      &upstream("/ui/slots/3?action=restore")
+    ));
+    assert!(!is_slot_action(&Method::GET, &upstream("/ui/slots")));
+    assert!(!is_slot_action(&Method::GET, &upstream("/ui/slots/0")));
+    assert!(!is_slot_action(
+      &Method::POST,
+      &upstream("/ui/v1/chat/completions")
+    ));
   }
 
   #[test]

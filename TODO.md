@@ -428,7 +428,13 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 4: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
-- [ ] Keep a model's prompt cache across an unload
+- [x] ~~Keep a model's prompt cache across an unload~~ — done: `backend.llamacpp.slot_cache` (off by default) saves every non-empty slot before the idle sweep or make-room unloads a llama.cpp chat launch and restores the files when a launch with the same argv turns ready. Spike: [`docs/spikes/2026-10-10-slot-save-restore.md`](docs/spikes/2026-10-10-slot-save-restore.md).
+- [ ] Slot cache: decide whether `slot_cache.enabled` should default to on. It is off because one save is GiB-sized at long contexts (3.05 GiB at 100k tokens on a 1B model).
+- [ ] Slot cache: real-hardware run on a large model (27B or bigger) and on a slow disk. The spike only measured a 1B model on NVMe, so file size and save time per token on a large model are unknown ([`docs/testing/hardware-uat.md`](docs/testing/hardware-uat.md)).
+- [ ] Slot cache: estimate a save's size before writing it. Today a save larger than `max_gib` is written, then deleted. The first save of a launch shape gives bytes per token.
+- [ ] Slot cache: show saves and restores outside the daemon log, for example a `restored cache` note on the request log row and a count in `status --json`.
+- [ ] Slot cache: conversations `llama-server` has moved to its in-RAM prompt cache (`--cache-ram`, `--cache-idle-slots`) are not saved, only what sits in a slot at the unload.
+- [ ] Slot cache: nothing deletes the files after `slot_cache.enabled` is set back to `false`. Prune at daemon start, or add a command.
 - [ ] Warm the page cache before a load (`llamastash warm <model>`)
 
 ### Batch 5: CLI setup commands ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-5-cli-setup-commands))

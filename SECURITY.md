@@ -52,6 +52,15 @@ daemon's state directory:
   (always `127.0.0.1`) but can't check what a foreign binary binds, so
   binding loopback is the entry author's job.
 - The daemon does **not** persist or transmit telemetry.
+- With `backend.llamacpp.slot_cache.enabled` (off by default), an idle
+  unload writes the model's prompt cache to
+  `<cache dir>/slot-cache`. Those files contain the conversation's
+  tokens. The directory is created mode `0700`; the files are deleted
+  when restored, or after `max_age_secs`. The flag that enables this
+  (`--slot-save-path`) also turns on `llama-server`'s slot save and
+  restore endpoints on its loopback port. The proxy does not forward
+  them: `/v1/*` never reaches them and `/ui` refuses a `POST` under
+  `/slots/`.
 
 Issues we treat as in scope:
 

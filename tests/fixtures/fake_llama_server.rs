@@ -24,6 +24,7 @@
 //!   like an engine that drains before it stops)
 //! - `--print-env <VAR>` (test-only, repeatable — print `env VAR=<value>` to
 //!   stdout at start, so a test can read the child's environment from its log)
+//! - `--slot-save-path <DIR>` (enables `POST /slots/<id>?action=save|restore`)
 //! - `--print-argv` (test-only — print `argv <args…>` to stdout at start)
 //! - `--list-devices` (one-shot, mirrors real `llama-server`: prints a
 //!   fake adapter table and exits *without* serving). The number of
@@ -72,7 +73,13 @@ struct Args {
   /// a real llama-server after generation — the fixture the status
   /// draft-acceptance scan asserts against.
   spec_mtp: bool,
+  /// `--slot-save-path`: where the slot save and restore endpoints read and
+  /// write. `None` answers them 501, as real llama-server does without the flag.
+  slot_save_path: Option<String>,
 }
+
+/// Token count a fake slot save reports and writes as the file body.
+const FAKE_SLOT_TOKENS: &str = "4242";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -130,6 +137,7 @@ fn parse_args() -> Args {
   let mut sigterm_exit_delay_ms = None;
   let mut print_env = Vec::new();
   let mut spec_mtp = false;
+  let mut slot_save_path = None;
   while let Some(arg) = args.next() {
     match arg.as_str() {
       "--host" => host = args.next().expect("--host needs value"),
@@ -150,6 +158,7 @@ fn parse_args() -> Args {
         sigterm_exit_delay_ms = args.next().and_then(|v| v.parse().ok());
       }
       "--print-env" => print_env.extend(args.next()),
+      "--slot-save-path" => slot_save_path = args.next(),
       // Silently ignore unknown flags so the supervisor can pass
       // through reasoning bundles + advanced overrides without
       // teaching the fixture every llama-server flag.
@@ -168,6 +177,7 @@ fn parse_args() -> Args {
     sigterm_exit_delay_ms,
     print_env,
     spec_mtp,
+    slot_save_path,
   }
 }
 
@@ -204,6 +214,14 @@ async fn main() {
   }
 
   let args = parse_args();
+
+  // Real llama-server refuses to start when the directory is missing.
+  if let Some(dir) = &args.slot_save_path {
+    if !std::path::Path::new(dir).is_dir() {
+      eprintln!("error while handling argument \"--slot-save-path\": not a directory: {dir}");
+      std::process::exit(1);
+    }
+  }
 
   if args.trap_sigterm {
     // Re-register the SIGTERM handler as a no-op so the supervisor's
@@ -491,6 +509,56 @@ async fn handle(
         );
         write_response(&mut wr, 200, "text/event-stream", stream.as_bytes()).await?;
       }
+    }
+    ("POST", p) if p.starts_with("/slots/") => {
+      // Mirror llama-server's slot save and restore. A save writes a small
+      // file and reports `FAKE_SLOT_TOKENS` tokens; a restore reads the count
+      // back and prints a line to stderr a test can find in the launch log.
+      let action = p.split_once("action=").map(|(_, a)| a).unwrap_or("");
+      let filename = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("filename")?.as_str().map(str::to_string))
+        .unwrap_or_default();
+      let (status, reply) = match (&args.slot_save_path, action) {
+        (None, _) => (
+          501,
+          serde_json::json!({"error": {"message": "This server does not support slots action."}}),
+        ),
+        (Some(dir), "save") => {
+          std::fs::write(std::path::Path::new(dir).join(&filename), FAKE_SLOT_TOKENS)?;
+          let n: u64 = FAKE_SLOT_TOKENS.parse().unwrap_or(0);
+          (200, serde_json::json!({"filename": filename, "n_saved": n}))
+        }
+        (Some(dir), "restore") => {
+          match std::fs::read_to_string(std::path::Path::new(dir).join(&filename))
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+          {
+            Some(n) => {
+              eprintln!("fake slot restore: {filename} n_restored={n}");
+              (
+                200,
+                serde_json::json!({"filename": filename, "n_restored": n}),
+              )
+            }
+            None => (
+              400,
+              serde_json::json!({"error": {"message": "Unable to restore slot"}}),
+            ),
+          }
+        }
+        _ => (
+          400,
+          serde_json::json!({"error": {"message": "Invalid action"}}),
+        ),
+      };
+      write_response(
+        &mut wr,
+        status,
+        "application/json",
+        reply.to_string().as_bytes(),
+      )
+      .await?;
     }
     ("POST", "/v1/embeddings") => {
       let body = serde_json::json!({

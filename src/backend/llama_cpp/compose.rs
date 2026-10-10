@@ -131,6 +131,7 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
     &[],
     "compose",
   ));
+  argv.extend(super::slot_cache::argv(params));
   argv
 }
 

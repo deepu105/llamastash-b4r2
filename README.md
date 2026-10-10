@@ -335,6 +335,7 @@ Quick tour of the top-level keys:
 | `daemon.port_range`           | Inclusive `{start, end}` TCP range the supervisor picks from. Default `41100..=41300`.                                                                                    |
 | `daemon.probe_timeout_secs`   | Health-probe deadline per launch. Default `120`. Bump for 70B+ on slow disks.                                                                                             |
 | `daemon.idle_timeout_secs`    | Shut the daemon down after N seconds with no running models and no client attached. Default `0` (never).                                                                  |
+| `backend.llamacpp.slot_cache` | Keep a launch's prompt cache on disk across an idle unload, so the next request skips prompt reprocessing. Default off; `max_gib` (16) and `max_age_secs` (86400) bound it. |
 | `daemon.metrics_interval_secs` | Host-metrics sampler cadence. Default `1` (1 Hz), clamped to `1..=60`. Raise it to spawn `nvidia-smi` / `rocm-smi` less often.                                           |
 | `gpu.enable_vulkan_probe`     | Run the `vulkaninfo` fallback probe. Default `true`; `false` skips it when a native NVIDIA/AMD/Metal probe already covers your GPUs.                                      |
 | `gpu.reprobe_interval_secs`   | How often to re-run the full vendor probe chain for hotplug / late driver loads. Default `60`; `0` probes only at daemon start.                                           |
